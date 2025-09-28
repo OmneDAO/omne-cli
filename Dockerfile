@@ -1,11 +1,11 @@
-# Multi-stage build for OMNE CLI
-FROM rust:1.75-slim-bookworm as builder
+# Multi-stage build for optimal image size and security
+FROM rust:1.82-alpine as builder
 
 # Install dependencies
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache \
+    pkgconfig \
+    openssl-dev \
+    musl-dev
 
 WORKDIR /app
 
@@ -19,16 +19,13 @@ COPY src ./src
 RUN cargo build --release
 
 # Runtime stage
-FROM debian:bookworm-slim
+FROM alpine:3.19
 
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache ca-certificates curl
 
 # Create non-root user
-RUN useradd --create-home --shell /bin/bash omne
+RUN adduser -D -s /bin/sh omne
 
 # Copy binary from builder stage
 COPY --from=builder /app/target/release/omne /usr/local/bin/omne

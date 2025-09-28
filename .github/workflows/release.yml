@@ -1,5 +1,10 @@
 name: Release OMNE CLI
 
+# Required secrets:
+# - CARGO_REGISTRY_TOKEN: Token for publishing to crates.io
+# - HOMEBREW_GITHUB_TOKEN: GitHub token for updating Homebrew formula
+# - DOCS_DEPLOY_TOKEN: GitHub token for deploying documentation
+
 on:
   push:
     tags:
@@ -28,6 +33,7 @@ jobs:
         id: create_release
         uses: actions/github-script@v7
         with:
+          result-encoding: string
           script: |
             const { data } = await github.rest.repos.createRelease({
               owner: context.repo.owner,
@@ -38,6 +44,8 @@ jobs:
               draft: false,
               prerelease: false
             });
+            // Set outputs for other jobs
+            core.setOutput('upload_url', data.upload_url);
             return data.id;
 
   build-binaries:
