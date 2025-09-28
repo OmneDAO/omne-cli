@@ -1,10 +1,9 @@
 # Multi-stage build for optimal image size and security
 FROM rust:1.82-alpine as builder
 
-# Install dependencies
+# Install dependencies - minimal set for pure Rust build
 RUN apk add --no-cache \
     pkgconfig \
-    openssl-dev \
     musl-dev
 
 WORKDIR /app

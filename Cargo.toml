@@ -1,6 +1,6 @@
 [package]
 name = "omne-cli"
-version = "0.1.0"
+version = "0.1.4"
 edition = "2021"
 authors = ["Omne Network <dev@omne.network>"]
 description = "Unified command-line orchestration tool for the Omne blockchain ecosystem"
@@ -22,8 +22,8 @@ clap_complete = "4.4"
 # Async runtime
 tokio = { version = "1.0", features = ["full"] }
 
-# HTTP client for API calls
-reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+# HTTP client for API calls - using rustls instead of OpenSSL for better cross-compilation
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
 
 # JSON handling
 serde = { version = "1.0", features = ["derive"] }
@@ -50,13 +50,14 @@ dialoguer = "0.11"
 walkdir = "2.4"
 toml = "0.8"
 
-# Cryptography (for key management) - pinned to avoid edition2024 compatibility issues
-ed25519-dalek = "=2.1.1"
+# Cryptography (for key management) - pure Rust implementations for cross-compilation
+ed25519-dalek = { version = "=2.1.1", features = ["rand_core"] }
 rand = "0.8"
 
 # Network utilities
 url = "2.4"
 
+# Remove OpenSSL dependency by using pure Rust crypto
 # Force compatible base64ct version to avoid edition2024 requirement
 [dependencies.base64ct]
 version = "=1.6.0"
