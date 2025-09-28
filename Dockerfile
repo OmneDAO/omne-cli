@@ -12,10 +12,13 @@ WORKDIR /app
 # Copy manifests
 COPY Cargo.toml Cargo.lock ./
 
+# Clean lock file to avoid edition2024 conflicts
+RUN rm -f Cargo.lock
+
 # Copy source code
 COPY src ./src
 
-# Build application
+# Build application with clean dependency resolution
 RUN cargo build --release
 
 # Runtime stage
