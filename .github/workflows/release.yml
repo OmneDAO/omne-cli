@@ -228,5 +228,5 @@ jobs:
               owner: 'OmneDAO',
               repo: 'omne-foundation',
               workflow_id: 'deploy-docs.yml',
-              ref: 'main'
+              ref: 'master'
             });
