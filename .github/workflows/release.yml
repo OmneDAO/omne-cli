@@ -88,19 +88,17 @@ jobs:
         with:
           targets: ${{ matrix.target }}
           
-      - name: Install cross-compilation tools
-        if: matrix.os == 'ubuntu-latest'
+      - name: Install cross-compilation tool
+        if: matrix.os == 'ubuntu-latest' && contains(matrix.target, 'aarch64')
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          cargo install cross --git https://github.com/cross-rs/cross
           
-      - name: Configure cross-compilation
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
-          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
-          
-      - name: Build binary
+      - name: Build binary (cross-compilation)
+        if: matrix.os == 'ubuntu-latest' && contains(matrix.target, 'aarch64')
+        run: cross build --release --target ${{ matrix.target }}
+        
+      - name: Build binary (native)
+        if: ${{ !(matrix.os == 'ubuntu-latest' && contains(matrix.target, 'aarch64')) }}
         run: cargo build --release --target ${{ matrix.target }}
         
       - name: Package binary (Unix)
