@@ -133,16 +133,29 @@ jobs:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     needs: build-binaries
+    if: false  # Disabled until crates.io email is verified
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install Rust
+      - name: Crates.io Publishing Disabled
+        run: |
+          echo "⚠️  Crates.io publishing disabled until email verification:"
+          echo "1. Go to https://crates.io/settings/profile"
+          echo "2. Verify your email address"
+          echo "3. Re-enable this job by removing 'if: false'"
+          echo ""
+          echo "Current error: 'A verified email address is required to publish crates'"
+        
+      - name: Install Rust (Disabled)
+        if: false
         uses: dtolnay/rust-toolchain@stable
         
-      - name: Run tests
+      - name: Run tests (Disabled)
+        if: false
         run: cargo test --all-features
         
-      - name: Publish to crates.io
+      - name: Publish to crates.io (Disabled)
+        if: false
         run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   build-docker:
@@ -190,13 +203,24 @@ jobs:
           cache-to: type=gha,mode=max
 
   update-package-managers:
-    name: Update Package Managers
+    name: Update Package Managers (Disabled - Manual Setup Required)
     runs-on: ubuntu-latest
     needs: [create-release, build-binaries]
+    if: false  # Disabled until package managers are properly set up
     steps:
       - uses: actions/checkout@v4
       
-      - name: Update Homebrew Formula
+      - name: Package Manager Setup Required
+        run: |
+          echo "⚠️  Package manager updates disabled until initial setup:"
+          echo "1. Homebrew: Submit omne-cli formula to homebrew-core manually first"
+          echo "2. Chocolatey: Create account and submit initial package"
+          echo "3. Snap: Register omne-cli name in Snap Store"
+          echo ""
+          echo "After initial manual submission, re-enable this workflow"
+          
+      - name: Homebrew Formula (Disabled)
+        if: false
         uses: dawidd6/action-homebrew-bump-formula@v3
         with:
           token: ${{ secrets.HOMEBREW_GITHUB_TOKEN }}
