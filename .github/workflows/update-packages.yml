@@ -1,0 +1,95 @@
+name: Update Package Managers
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to update (e.g., v0.1.0)'
+        required: true
+        type: string
+
+jobs:
+  update-homebrew:
+    name: Update Homebrew Formula
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update Homebrew Formula
+        uses: dawidd6/action-homebrew-bump-formula@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          formula: omne-cli
+          tag: ${{ github.event.release.tag_name || github.event.inputs.version }}
+          revision: ${{ github.sha }}
+          force: false
+
+  update-chocolatey:
+    name: Update Chocolatey Package
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup NuGet
+        uses: nuget/setup-nuget@v1
+        
+      - name: Update Chocolatey Package
+        shell: powershell
+        run: |
+          $version = "${{ github.event.release.tag_name || github.event.inputs.version }}".TrimStart('v')
+          $downloadUrl = "https://github.com/${{ github.repository }}/releases/download/v$version/omne-windows-x86_64.zip"
+          
+          # Download the binary to calculate checksum
+          Invoke-WebRequest -Uri $downloadUrl -OutFile "omne-windows-x86_64.zip"
+          $checksum = (Get-FileHash -Algorithm SHA256 "omne-windows-x86_64.zip").Hash
+          
+          # Update nuspec version
+          $nuspecPath = "chocolatey/omne-cli.nuspec"
+          (Get-Content $nuspecPath) -replace '<version>.*</version>', "<version>$version</version>" | Set-Content $nuspecPath
+          
+          # Update install script with checksum
+          $installScript = "chocolatey/tools/chocolateyinstall.ps1"
+          (Get-Content $installScript) -replace 'PLACEHOLDER_CHECKSUM', $checksum | Set-Content $installScript
+          (Get-Content $installScript) -replace '\$version', $version | Set-Content $installScript
+          
+          # Package and publish (requires API key)
+          choco pack chocolatey/omne-cli.nuspec --outputdirectory chocolatey/
+          # choco push chocolatey/omne-cli.$version.nupkg --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
+
+  update-snap:
+    name: Update Snap Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Snapcraft
+        uses: snapcore/action-build@v1
+        
+      - name: Update Snap Version
+        run: |
+          version="${{ github.event.release.tag_name || github.event.inputs.version }}"
+          version=${version#v}  # Remove 'v' prefix
+          sed -i "s/version: '.*'/version: '$version'/" snap/snapcraft.yaml
+          
+      - name: Build Snap
+        run: snapcraft
+        
+      - name: Publish Snap
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        run: |
+          echo "$SNAPCRAFT_STORE_CREDENTIALS" | base64 -d > ~/.snap_credentials
+          snapcraft login --with ~/.snap_credentials
+          snapcraft upload --release=stable omne-cli_*.snap
+
+  update-aur:
+    name: Update AUR Package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update AUR Package
+        uses: ATGardner/aur-update-action@v1
+        with:
+          package_name: omne-cli
+          commit_username: 'OMNE Bot'
+          commit_email: 'bot@omne.network'
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}

@@ -1,0 +1,46 @@
+name: omne-cli
+base: core22
+version: '0.1.0'
+summary: Unified command-line orchestration tool for the Omne blockchain ecosystem
+description: |
+  The OMNE CLI provides comprehensive management for the Omne blockchain ecosystem,
+  including network operations, validator coordination, infrastructure services,
+  developer tools, and operational monitoring.
+
+  Features:
+  - Multi-network support (mainnet, testnet, devnet)
+  - Validator lifecycle management
+  - Infrastructure service deployment
+  - Development environment setup
+  - Real-time network monitoring
+  - Automated operational tasks
+
+grade: stable
+confinement: strict
+
+apps:
+  omne-cli:
+    command: bin/omne
+    plugs: [network, network-bind, home]
+    aliases: [omne]
+
+parts:
+  omne-cli:
+    plugin: rust
+    source: .
+    build-packages:
+      - pkg-config
+      - libssl-dev
+    stage-packages:
+      - libssl3
+      - ca-certificates
+    rust-features: []
+    
+  # Include shell completions
+  completions:
+    plugin: dump
+    source: completions/
+    organize:
+      bash/omne: usr/share/bash-completion/completions/omne
+      zsh/_omne: usr/share/zsh/site-functions/_omne
+      fish/omne.fish: usr/share/fish/vendor_completions.d/omne.fish

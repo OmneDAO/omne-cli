@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>omne-cli</id>
+    <version>0.1.0</version>
+    <packageSourceUrl>https://github.com/OmneDAO/omne-cli</packageSourceUrl>
+    <owners>OmneDAO</owners>
+    <title>OMNE CLI</title>
+    <authors>Omne Network</authors>
+    <projectUrl>https://omne.network</projectUrl>
+    <iconUrl>https://raw.githubusercontent.com/OmneDAO/omne-cli/main/assets/logo.png</iconUrl>
+    <copyright>2024 Omne Network</copyright>
+    <licenseUrl>https://github.com/OmneDAO/omne-cli/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <projectSourceUrl>https://github.com/OmneDAO/omne-cli</projectSourceUrl>
+    <docsUrl>https://docs.omne.foundation/cli</docsUrl>
+    <bugTrackerUrl>https://github.com/OmneDAO/omne-cli/issues</bugTrackerUrl>
+    <tags>blockchain cryptocurrency cli omne validator network</tags>
+    <summary>Unified command-line orchestration tool for the Omne blockchain ecosystem</summary>
+    <description>
+The OMNE CLI provides comprehensive management for the Omne blockchain ecosystem, including:
+
+* Network operations and management
+* Validator coordination and service management  
+* Infrastructure services orchestration
+* Developer tools and project scaffolding
+* Operational monitoring and maintenance
+
+Features:
+- Multi-network support (mainnet, testnet, devnet)
+- Validator lifecycle management
+- Infrastructure service deployment
+- Development environment setup
+- Real-time network monitoring
+- Automated operational tasks
+    </description>
+    <releaseNotes>https://github.com/OmneDAO/omne-cli/releases/tag/v0.1.0</releaseNotes>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>
