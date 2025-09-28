@@ -1,5 +1,10 @@
 name: Update Package Managers
 
+# Required secrets:
+# - CHOCOLATEY_API_KEY: API key for Chocolatey package publishing
+# - SNAPCRAFT_STORE_CREDENTIALS: Snapcraft store credentials for publishing
+# - AUR_SSH_PRIVATE_KEY: SSH private key for AUR package publishing
+
 on:
   release:
     types: [published]
@@ -57,39 +62,36 @@ jobs:
           # choco push chocolatey/omne-cli.$version.nupkg --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
 
   update-snap:
-    name: Update Snap Package
+    name: Update Snap Package (Disabled - Not Registered)
+    runs-on: ubuntu-latest
+    if: false  # Disabled until snap is registered in Snap Store
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Snap Registration Required
+        run: |
+          echo "⚠️  Snap package not yet registered in Snap Store"
+          echo "To enable snap publishing:"
+          echo "1. Register 'omne-cli' at https://snapcraft.io/register-snap"  
+          echo "2. Build initial snap: 'snapcraft'"
+          echo "3. Upload manually: 'snapcraft upload omne-cli_*.snap --release=stable'"
+          echo "4. Export credentials: 'snapcraft export-login ~/snap-credentials'"
+          echo "5. Add SNAPCRAFT_STORE_CREDENTIALS secret"
+          echo "6. Remove 'if: false' from this workflow"
+
+  update-aur:
+    name: Update AUR Package  
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       
-      - name: Setup Snapcraft
-        uses: snapcore/action-build@v1
-        
-      - name: Update Snap Version
+      - name: Update AUR Package (Manual Process)
         run: |
-          version="${{ github.event.release.tag_name || github.event.inputs.version }}"
-          version=${version#v}  # Remove 'v' prefix
-          sed -i "s/version: '.*'/version: '$version'/" snap/snapcraft.yaml
-          
-      - name: Build Snap
-        run: snapcraft
-        
-      - name: Publish Snap
-        env:
-          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
-        run: |
-          echo "$SNAPCRAFT_STORE_CREDENTIALS" | base64 -d > ~/.snap_credentials
-          snapcraft login --with ~/.snap_credentials
-          snapcraft upload --release=stable omne-cli_*.snap
-
-  update-aur:
-    name: Update AUR Package
-    runs-on: ubuntu-latest
-    steps:
-      - name: Update AUR Package
-        uses: ATGardner/aur-update-action@v1
-        with:
-          package_name: omne-cli
-          commit_username: 'OMNE Bot'
-          commit_email: 'bot@omne.network'
-          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          echo "AUR package update requires manual submission:"
+          echo "1. Clone AUR repository: git clone ssh://aur@aur.archlinux.org/omne-cli.git"
+          echo "2. Update PKGBUILD with new version and checksums"
+          echo "3. Update .SRCINFO with makepkg --printsrcinfo > .SRCINFO"
+          echo "4. Commit and push changes"
+          echo ""
+          echo "Version to update: ${{ github.event.release.tag_name || github.event.inputs.version }}"
+          # TODO: Implement automated AUR update when proper action is available
