@@ -1,5 +1,5 @@
 # Multi-stage build for optimal image size and security
-FROM rust:1.82-alpine as builder
+FROM rust:1.83-alpine as builder
 
 # Install dependencies - minimal set for pure Rust build
 RUN apk add --no-cache \
@@ -21,7 +21,7 @@ COPY src ./src
 RUN cargo build --release
 
 # Runtime stage
-FROM alpine:3.20
+FROM alpine:3.21
 
 # Install runtime dependencies
 RUN apk add --no-cache ca-certificates curl
