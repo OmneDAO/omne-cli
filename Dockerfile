@@ -1,21 +1,22 @@
 # Multi-stage build for optimal image size and security
-FROM rust:1.83-alpine as builder
+FROM rust:latest as builder
 
 # Install dependencies - minimal set for pure Rust build
-RUN apk add --no-cache \
-    pkgconfig \
-    musl-dev
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Copy manifests
-COPY Cargo.toml Cargo.lock ./
+COPY omne-cli/Cargo.toml omne-cli/Cargo.lock ./
 
 # Clean lock file to avoid edition2024 conflicts
 RUN rm -f Cargo.lock
 
 # Copy source code
-COPY src ./src
+COPY omne-cli/src ./src
 
 # Build application with clean dependency resolution
 RUN cargo build --release
