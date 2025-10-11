@@ -41,6 +41,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 config = "0.14"
 dirs = "5.0"
 
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
 # Terminal UI
 console = "0.15"
 indicatif = "0.17"
