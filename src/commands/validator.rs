@@ -331,12 +331,12 @@ async fn calculate_dynamic_stake() -> Result<u64> {
     let network_utilization = 0.45; // 45% network utilization (simulated)
     let validator_count = 85; // Current validator count (simulated)
     let base_stake = 15; // Base stake requirement
-    
+
     let utilization_factor = (0.5_f64).max((2.0_f64).min(network_utilization));
     let validator_density = (0.8_f64).max((1.5_f64).min(validator_count as f64 / 100.0));
-    
+
     let dynamic_stake = base_stake as f64 * utilization_factor * validator_density;
     let required_stake = (15_u64).max((28_u64).min(dynamic_stake as u64)); // 15-28 OGT range
-    
+
     Ok(required_stake)
 }
