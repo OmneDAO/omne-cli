@@ -291,6 +291,9 @@ fn print_node_status(status: &NodeStatusResponse, detailed: bool) {
     );
     println!("   Average Ping: {:.1} ms", status.stats.average_ping_ms);
     println!("   Uptime: {} s", status.stats.uptime_seconds);
+    if let Some(height) = status.best_persisted_security_height {
+        println!("   Best Persisted Security Height: {}", height);
+    }
 
     if let Some(dt) = DateTime::<Utc>::from_timestamp(status.last_updated, 0) {
         println!("   Last Updated: {}", dt.to_rfc3339());
@@ -392,6 +395,8 @@ struct NodeStatusResponse {
     peers: Vec<RpcPeerStatus>,
     stats: RpcNetworkStats,
     security: RpcSecuritySnapshot,
+    #[serde(default)]
+    best_persisted_security_height: Option<u64>,
     last_updated: i64,
 }
 
