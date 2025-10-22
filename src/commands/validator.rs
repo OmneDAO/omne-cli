@@ -2,8 +2,15 @@
 
 use crate::config::Config;
 use crate::utils::{confirm, spinner};
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use clap::Subcommand;
+use reqwest::Client;
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::fmt;
+use tokio::time::{sleep, Duration};
 use tracing::{info, warn};
 
 #[derive(Subcommand)]
@@ -57,6 +64,12 @@ pub enum ValidatorCommands {
         period: String,
     },
 
+    /// Inspect and resolve fraud challenges
+    Challenges {
+        #[command(subcommand)]
+        action: ChallengeCommands,
+    },
+
     /// Validator status and health
     Status {
         /// Show infrastructure service status
@@ -105,7 +118,49 @@ pub enum ServiceCommands {
     Status,
 }
 
+#[derive(Subcommand)]
+pub enum ChallengeCommands {
+    /// List pending fraud challenges registered by the security layer
+    Pending {
+        /// Maximum number of challenges to display (0 = all)
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// List resolved fraud challenges and their verdicts
+    Resolved {
+        /// Maximum number of challenges to display (0 = all)
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// Show full details for a specific challenge identifier
+    Show {
+        /// Challenge identifier to inspect
+        id: u64,
+    },
+    /// Resolve a pending challenge with an explicit verdict
+    Resolve {
+        /// Challenge identifier to resolve
+        id: u64,
+        /// Verdict to apply (proven_fraud, rejected, expired, cleared)
+        verdict: String,
+        /// Optional operator note recorded with the resolution
+        #[arg(long)]
+        note: Option<String>,
+    },
+}
+
 pub async fn execute(command: ValidatorCommands, config: &Config) -> Result<()> {
+    if requires_rpc(&command) {
+        crate::config::probe_rpc_endpoint(&config.network.rpc_endpoint)
+            .await
+            .with_context(|| {
+                format!(
+                    "Unable to reach validator RPC endpoint at {}",
+                    config.network.rpc_endpoint
+                )
+            })?;
+    }
+
     match command {
         ValidatorCommands::Init { data_dir, services } => {
             init_validator(&data_dir, &services, config).await
@@ -120,19 +175,31 @@ pub async fn execute(command: ValidatorCommands, config: &Config) -> Result<()> 
         ValidatorCommands::Earnings { breakdown, period } => {
             show_earnings(breakdown, &period, config).await
         }
+        ValidatorCommands::Challenges { action } => handle_challenges(action, config).await,
         ValidatorCommands::Status { services } => show_validator_status(services, config).await,
     }
+}
+
+fn requires_rpc(command: &ValidatorCommands) -> bool {
+    matches!(
+        command,
+        ValidatorCommands::Stake { .. }
+            | ValidatorCommands::Services { .. }
+            | ValidatorCommands::Earnings { .. }
+            | ValidatorCommands::Challenges { .. }
+            | ValidatorCommands::Status { .. }
+    )
 }
 
 async fn init_validator(data_dir: &str, services: &[String], _config: &Config) -> Result<()> {
     info!("🔧 Initializing Omne validator...");
 
     let progress = spinner("Creating validator directory structure...");
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    sleep(Duration::from_secs(1)).await;
     progress.finish_with_message("✅ Directory structure created");
 
     let progress = spinner("Generating validator keys...");
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    sleep(Duration::from_secs(2)).await;
     progress.finish_with_message("✅ Validator keys generated");
 
     if !services.is_empty() {
@@ -141,7 +208,7 @@ async fn init_validator(data_dir: &str, services: &[String], _config: &Config) -
             services.join(", ")
         );
         let progress = spinner("Setting up service configurations...");
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        sleep(Duration::from_secs(2)).await;
         progress.finish_with_message("✅ Services configured");
     }
 
@@ -156,6 +223,290 @@ async fn init_validator(data_dir: &str, services: &[String], _config: &Config) -
     info!("   Next: Run 'omne validator start' to begin validation");
 
     Ok(())
+}
+
+async fn handle_challenges(action: ChallengeCommands, config: &Config) -> Result<()> {
+    let endpoint = &config.network.rpc_endpoint;
+
+    match action {
+        ChallengeCommands::Pending { limit } => {
+            let mut challenges: Vec<ChallengeRecord> =
+                rpc_request(endpoint, "omne_getPendingChallenges", json!([])).await?;
+
+            if challenges.is_empty() {
+                info!("🎯 No pending fraud challenges reported by the node");
+                return Ok(());
+            }
+
+            challenges.sort_by_key(|record| record.expires_at);
+            print_challenge_list(&challenges, limit, false);
+        }
+        ChallengeCommands::Resolved { limit } => {
+            let mut challenges: Vec<ChallengeRecord> =
+                rpc_request(endpoint, "omne_getResolvedChallenges", json!([])).await?;
+
+            if challenges.is_empty() {
+                info!("ℹ️ No resolved fraud challenges recorded yet");
+                return Ok(());
+            }
+
+            challenges.sort_by(|a, b| {
+                let a_ts = resolved_timestamp(&a.status).unwrap_or(0);
+                let b_ts = resolved_timestamp(&b.status).unwrap_or(0);
+                b_ts.cmp(&a_ts)
+            });
+            print_challenge_list(&challenges, limit, true);
+        }
+        ChallengeCommands::Show { id } => {
+            let record: Option<ChallengeRecord> =
+                rpc_request(endpoint, "omne_getChallengeById", json!([id])).await?;
+
+            match record {
+                Some(record) => print_challenge_details(&record),
+                None => warn!("❓ Challenge #{} not found on the node", id),
+            }
+        }
+        ChallengeCommands::Resolve { id, verdict, note } => {
+            let resolution = parse_resolution(&verdict)?;
+            let params = if let Some(note) = note {
+                json!([id, resolution_to_param(resolution), note])
+            } else {
+                json!([id, resolution_to_param(resolution)])
+            };
+
+            let record: Option<ChallengeRecord> =
+                rpc_request(endpoint, "omne_resolveChallenge", params).await?;
+
+            match record {
+                Some(record) => {
+                    info!("✅ Challenge #{} resolved as {}", record.id, resolution);
+                    print_challenge_details(&record);
+                }
+                None => warn!(
+                    "⚠️ Challenge #{} was not found or has already been resolved",
+                    id
+                ),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn print_challenge_list(challenges: &[ChallengeRecord], limit: usize, resolved: bool) {
+    let total = challenges.len();
+    let to_show = if limit == 0 { total } else { limit.min(total) };
+
+    if resolved {
+        println!(
+            "\n✅ Resolved Challenges (showing {} of {})",
+            to_show, total
+        );
+    } else {
+        println!(
+            "\n⚠️ Pending Fraud Challenges (showing {} of {})",
+            to_show, total
+        );
+    }
+
+    for record in challenges.iter().take(to_show) {
+        println!(
+            "   • Challenge #{} – block {} (security #{})",
+            record.id, record.block_number, record.security_block_ref
+        );
+        println!(
+            "     Proof digest: {} | Submitted: {}",
+            short_hash(&record.fraud_proof_hash),
+            format_relative_time(record.submitted_at)
+        );
+        if let Some(challenger) = record.challenger.as_deref() {
+            println!("     Challenger: {}", challenger);
+        }
+        match &record.status {
+            ChallengeStatus::Pending => println!(
+                "     Status: Pending – {} remaining",
+                format_future_time(record.expires_at)
+            ),
+            ChallengeStatus::Resolved {
+                verdict,
+                resolved_at,
+                note,
+            } => {
+                println!(
+                    "     Status: {} – {}",
+                    verdict,
+                    format_relative_time(*resolved_at)
+                );
+                if let Some(note) = note.as_deref() {
+                    println!("     Note: {}", note);
+                }
+            }
+        }
+    }
+
+    if to_show < total {
+        println!("   … {} additional record(s) not shown", total - to_show);
+    }
+}
+
+fn print_challenge_details(record: &ChallengeRecord) {
+    println!(
+        "\n🔎 Challenge #{} – block {} (security ref #{})",
+        record.id, record.block_number, record.security_block_ref
+    );
+    println!("   Block hash: {}", record.block_hash);
+    println!(
+        "   Fraud proof digest: {}",
+        short_hash(&record.fraud_proof_hash)
+    );
+    println!(
+        "   Submitted: {} ({})",
+        format_timestamp(record.submitted_at),
+        format_relative_time(record.submitted_at)
+    );
+    println!(
+        "   Expires: {} ({})",
+        format_timestamp(record.expires_at),
+        format_future_time(record.expires_at)
+    );
+    println!(
+        "   Challenger: {}",
+        record.challenger.as_deref().unwrap_or("unknown")
+    );
+    if let Some(proposer) = record.offending_proposer.as_deref() {
+        println!("   Offending proposer: {}", proposer);
+    }
+
+    match &record.status {
+        ChallengeStatus::Pending => println!(
+            "   Status: Pending – {} remaining",
+            format_future_time(record.expires_at)
+        ),
+        ChallengeStatus::Resolved {
+            verdict,
+            resolved_at,
+            note,
+        } => {
+            println!(
+                "   Status: Resolved as {} at {} ({})",
+                verdict,
+                format_timestamp(*resolved_at),
+                format_relative_time(*resolved_at)
+            );
+            if let Some(note) = note.as_deref() {
+                println!("   Resolution note: {}", note);
+            }
+        }
+    }
+}
+
+fn parse_resolution(value: &str) -> Result<ChallengeResolution> {
+    let verdict = value.trim().to_ascii_lowercase();
+    match verdict.as_str() {
+        "proven_fraud" | "proven-fraud" | "fraud" | "valid" => {
+            Ok(ChallengeResolution::ProvenFraud)
+        }
+        "rejected" | "invalid" => Ok(ChallengeResolution::Rejected),
+        "expired" | "timeout" | "timed_out" => Ok(ChallengeResolution::Expired),
+        "cleared" | "dismissed" | "manual" => Ok(ChallengeResolution::Cleared),
+        other => Err(anyhow!(
+            "Unsupported challenge verdict '{}'. Expected one of: proven_fraud, rejected, expired, cleared.",
+            other
+        )),
+    }
+}
+
+fn resolution_to_param(resolution: ChallengeResolution) -> &'static str {
+    match resolution {
+        ChallengeResolution::ProvenFraud => "proven_fraud",
+        ChallengeResolution::Rejected => "rejected",
+        ChallengeResolution::Expired => "expired",
+        ChallengeResolution::Cleared => "cleared",
+    }
+}
+
+fn resolved_timestamp(status: &ChallengeStatus) -> Option<u64> {
+    match status {
+        ChallengeStatus::Resolved { resolved_at, .. } => Some(*resolved_at),
+        _ => None,
+    }
+}
+
+fn short_hash(value: &str) -> String {
+    if value.len() <= 12 {
+        value.to_string()
+    } else {
+        format!("{}…{}", &value[..6], &value[value.len() - 4..])
+    }
+}
+
+fn format_timestamp(ts: u64) -> String {
+    match to_datetime(ts) {
+        Some(dt) => dt.to_rfc3339_opts(SecondsFormat::Secs, true),
+        None => ts.to_string(),
+    }
+}
+
+fn format_relative_time(ts: u64) -> String {
+    match to_datetime(ts) {
+        Some(dt) => {
+            let now = Utc::now();
+            let delta = now.timestamp() - dt.timestamp();
+            if delta >= 0 {
+                format!("{} ago", format_duration(delta as u64))
+            } else {
+                format!("in {}", format_duration(delta.unsigned_abs()))
+            }
+        }
+        None => "-".to_string(),
+    }
+}
+
+fn format_future_time(ts: u64) -> String {
+    match to_datetime(ts) {
+        Some(dt) => {
+            let now = Utc::now();
+            let delta = dt.timestamp() - now.timestamp();
+            if delta >= 0 {
+                format_duration(delta as u64)
+            } else {
+                format!("{} overdue", format_duration(delta.unsigned_abs()))
+            }
+        }
+        None => "-".to_string(),
+    }
+}
+
+fn to_datetime(ts: u64) -> Option<DateTime<Utc>> {
+    if ts > i64::MAX as u64 {
+        return None;
+    }
+    Utc.timestamp_opt(ts as i64, 0).single()
+}
+
+fn format_duration(mut seconds: u64) -> String {
+    let days = seconds / 86_400;
+    seconds %= 86_400;
+    let hours = seconds / 3_600;
+    seconds %= 3_600;
+    let minutes = seconds / 60;
+    let secs = seconds % 60;
+
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{}d", days));
+    }
+    if hours > 0 {
+        parts.push(format!("{}h", hours));
+    }
+    if minutes > 0 {
+        parts.push(format!("{}m", minutes));
+    }
+    if secs > 0 || parts.is_empty() {
+        parts.push(format!("{}s", secs));
+    }
+
+    parts.join(" ")
 }
 
 async fn start_validator(
@@ -181,16 +532,16 @@ async fn start_validator(
     }
 
     let progress = spinner("Starting consensus engine...");
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    sleep(Duration::from_secs(2)).await;
     progress.finish_with_message("✅ Consensus engine running");
 
     let progress = spinner("Initializing P2P network...");
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    sleep(Duration::from_secs(1)).await;
     progress.finish_with_message("✅ P2P network connected");
 
     if auto_optimize {
         let progress = spinner("Optimizing infrastructure services...");
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        sleep(Duration::from_secs(2)).await;
         progress.finish_with_message("✅ Services optimized for revenue");
     }
 
@@ -217,7 +568,7 @@ async fn manage_stake(action: StakeCommands, _config: &Config) -> Result<()> {
         StakeCommands::Add { amount } => {
             info!("💰 Adding {} OGT to validator stake", amount);
             let progress = spinner("Processing stake addition...");
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            sleep(Duration::from_secs(2)).await;
             progress.finish_with_message("✅ Stake added successfully");
         }
         StakeCommands::Remove { amount } => {
@@ -226,7 +577,7 @@ async fn manage_stake(action: StakeCommands, _config: &Config) -> Result<()> {
                 return Ok(());
             }
             let progress = spinner("Processing stake removal...");
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            sleep(Duration::from_secs(2)).await;
             progress.finish_with_message("✅ Unstaking initiated (21-day unbonding period)");
         }
         StakeCommands::Info => {
@@ -246,13 +597,13 @@ async fn manage_services(action: ServiceCommands, _config: &Config) -> Result<()
         ServiceCommands::Enable { service } => {
             info!("🔧 Enabling {} service", service);
             let progress = spinner(&format!("Configuring {} service...", service));
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            sleep(Duration::from_secs(2)).await;
             progress.finish_with_message(format!("✅ {} service enabled", service));
         }
         ServiceCommands::Disable { service } => {
             info!("🔧 Disabling {} service", service);
             let progress = spinner(&format!("Stopping {} service...", service));
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            sleep(Duration::from_secs(1)).await;
             progress.finish_with_message(format!("✅ {} service disabled", service));
         }
         ServiceCommands::Configure {
@@ -264,7 +615,7 @@ async fn manage_services(action: ServiceCommands, _config: &Config) -> Result<()
                 info!("Using configuration file: {}", file);
             }
             let progress = spinner("Applying configuration...");
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            sleep(Duration::from_secs(1)).await;
             progress.finish_with_message("✅ Configuration applied");
         }
         ServiceCommands::Status => {
@@ -339,4 +690,108 @@ async fn calculate_dynamic_stake() -> Result<u64> {
     let required_stake = (15_u64).max((28_u64).min(dynamic_stake as u64)); // 15-28 OGT range
 
     Ok(required_stake)
+}
+async fn rpc_request<T: DeserializeOwned>(
+    endpoint: &str,
+    method: &str,
+    params: Value,
+) -> Result<T> {
+    let client = Client::new();
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+        "id": 1,
+    });
+
+    let response = client
+        .post(endpoint)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|err| anyhow!("Failed to reach node RPC at {}: {}", endpoint, err))?;
+
+    if !response.status().is_success() {
+        return Err(anyhow!(
+            "RPC request '{}' failed with status {}",
+            method,
+            response.status()
+        ));
+    }
+
+    let rpc: JsonRpcResponse<T> = response
+        .json()
+        .await
+        .map_err(|err| anyhow!("Malformed RPC response for {}: {}", method, err))?;
+
+    if let Some(error) = rpc.error {
+        return Err(anyhow!("RPC error {}: {}", error.code, error.message));
+    }
+
+    rpc.result
+        .ok_or_else(|| anyhow!("RPC response missing result for {}", method))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChallengeRecord {
+    id: u64,
+    block_hash: String,
+    block_number: u64,
+    security_block_ref: u64,
+    #[serde(default)]
+    challenger: Option<String>,
+    #[serde(default)]
+    offending_proposer: Option<String>,
+    fraud_proof_hash: String,
+    submitted_at: u64,
+    expires_at: u64,
+    status: ChallengeStatus,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum ChallengeStatus {
+    Pending,
+    Resolved {
+        verdict: ChallengeResolution,
+        resolved_at: u64,
+        #[serde(default)]
+        note: Option<String>,
+    },
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum ChallengeResolution {
+    ProvenFraud,
+    Rejected,
+    Expired,
+    Cleared,
+}
+
+impl fmt::Display for ChallengeResolution {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ChallengeResolution::ProvenFraud => write!(f, "Proven fraud"),
+            ChallengeResolution::Rejected => write!(f, "Rejected"),
+            ChallengeResolution::Expired => write!(f, "Expired"),
+            ChallengeResolution::Cleared => write!(f, "Cleared"),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcResponse<T> {
+    jsonrpc: Option<String>,
+    result: Option<T>,
+    error: Option<JsonRpcError>,
+    id: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcError {
+    code: i32,
+    message: String,
+    data: Option<Value>,
 }

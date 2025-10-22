@@ -3,7 +3,7 @@
 use crate::config::Config;
 use crate::utils::{confirm, spinner};
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use clap::Subcommand;
 use serde::Deserialize;
 use serde_json::Value;
@@ -148,19 +148,39 @@ async fn show_network_status(
         warn!("🔄 Live monitoring enabled ({}s interval)", interval);
         loop {
             match fetch_node_status(endpoint).await {
-                Ok(status) => print_node_status(&status, detailed),
+                Ok(status) => {
+                    let consensus = match fetch_consensus_metrics(endpoint).await {
+                        Ok(metrics) => Some(metrics),
+                        Err(err) => {
+                            warn!("⚠️  Failed to fetch consensus telemetry: {}", err);
+                            None
+                        }
+                    };
+                    print_node_status(&status, consensus.as_ref(), detailed);
+                }
                 Err(err) => warn!("⚠️  Failed to fetch node status: {}", err),
             }
             sleep(Duration::from_secs(interval)).await;
         }
     } else {
-        match fetch_node_status(endpoint).await {
-            Ok(status) => print_node_status(&status, detailed),
+        let status = fetch_node_status(endpoint)
+            .await
+            .map_err(|err| {
+                warn!(
+                    "⚠️  Unable to reach RPC endpoint {}: {}. Re-run with --simulate to view canned metrics.",
+                    endpoint,
+                    err
+                );
+                err
+            })?;
+        let consensus = match fetch_consensus_metrics(endpoint).await {
+            Ok(metrics) => Some(metrics),
             Err(err) => {
-                warn!("⚠️  Falling back to simulation: {}", err);
-                render_simulated_status(detailed, None).await;
+                warn!("⚠️  Failed to fetch consensus telemetry: {}", err);
+                None
             }
-        }
+        };
+        print_node_status(&status, consensus.as_ref(), detailed);
     }
 
     Ok(())
@@ -210,6 +230,16 @@ async fn render_simulated_status(detailed: bool, watch: Option<u64>) {
     println!("   Active Validators: 21");
     println!("   Network Utilization: 45%");
     println!("   Bandwidth Sent/Received: 12.5 MB / 11.8 MB");
+
+    println!("\n🪐 Consensus:");
+    println!("   Commerce Height: 1,234,567");
+    println!("   Security Height: 98,765");
+    println!("   Pending Commerce Blocks: 3");
+    println!("   Finality Queue Depth: 1");
+    println!("   Instant Finality Rate: 96.5%");
+    println!("   Last Security Commit: 98,760");
+    println!("   Proposer Reputation: 0.94");
+    println!("   Latest Finalized Block: 0xabc123...def0 (round 144, sigs 18)");
 
     if detailed {
         println!("\n⚡ Performance Metrics:");
@@ -274,7 +304,44 @@ async fn fetch_node_status(endpoint: &str) -> Result<NodeStatusResponse> {
         .ok_or_else(|| anyhow!("RPC response missing result"))
 }
 
-fn print_node_status(status: &NodeStatusResponse, detailed: bool) {
+async fn fetch_consensus_metrics(endpoint: &str) -> Result<ConsensusTelemetryResponse> {
+    let client = reqwest::Client::new();
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "omne_consensusTelemetry",
+        "params": [],
+        "id": 1,
+    });
+
+    let response = client
+        .post(endpoint)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|err| anyhow!("Failed to reach node RPC at {}: {}", endpoint, err))?;
+
+    if !response.status().is_success() {
+        return Err(anyhow!(
+            "RPC request failed with status {}",
+            response.status()
+        ));
+    }
+
+    let rpc: JsonRpcResponse<ConsensusTelemetryResponse> = response.json().await?;
+
+    if let Some(error) = rpc.error {
+        return Err(anyhow!("RPC error {}: {}", error.code, error.message));
+    }
+
+    rpc.result
+        .ok_or_else(|| anyhow!("RPC response missing result"))
+}
+
+fn print_node_status(
+    status: &NodeStatusResponse,
+    consensus: Option<&ConsensusTelemetryResponse>,
+    detailed: bool,
+) {
     info!("📊 Omne Network Status");
 
     println!("\n🌐 Network Overview:");
@@ -297,6 +364,46 @@ fn print_node_status(status: &NodeStatusResponse, detailed: bool) {
 
     if let Some(dt) = DateTime::<Utc>::from_timestamp(status.last_updated, 0) {
         println!("   Last Updated: {}", dt.to_rfc3339());
+    }
+
+    if let Some(consensus) = consensus {
+        println!("\n🪐 Consensus:");
+        println!("   Commerce Height: {}", consensus.commerce_height);
+        println!("   Security Height: {}", consensus.security_height);
+        println!(
+            "   Pending Commerce Blocks: {}",
+            consensus.pending_commerce_blocks
+        );
+        println!(
+            "   Finality Queue Depth: {}",
+            consensus.delayed_finality_queue_depth
+        );
+        println!(
+            "   Instant Finality Rate: {:.1}%",
+            consensus.instant_finality_rate * 100.0
+        );
+        println!(
+            "   Last Security Commit: {}",
+            consensus.last_security_commit
+        );
+
+        if let Some(score) = consensus.proposer_reputation_score {
+            println!("   Proposer Reputation: {:.2}", score);
+        }
+
+        if let Some(ts) = value_to_datetime(&consensus.timestamp_ms) {
+            println!("   Snapshot Captured: {}", ts.to_rfc3339());
+        }
+
+        if let Some(block) = &consensus.latest_finalized_block {
+            println!(
+                "   Latest Finalized Block: {} (round {}, sigs {})",
+                block.hash, block.round, block.signature_count
+            );
+            if let Some(finalized) = value_to_datetime(&block.finalized_at_ms) {
+                println!("   Finalized At: {}", finalized.to_rfc3339());
+            }
+        }
     }
 
     if !status.peers.is_empty() {
@@ -323,6 +430,9 @@ fn print_node_status(status: &NodeStatusResponse, detailed: bool) {
     }
 
     if detailed {
+        println!("\n📶 Peer Metrics:");
+        println!("   Peer Count (reported): {}", status.peer_count);
+
         println!("\n🛡️  Security Snapshot:");
         println!(
             "   DDoS Connections/Banned: {}/{}",
@@ -364,6 +474,21 @@ fn format_bytes(value: u64) -> String {
         v if v >= KB as u64 => format!("{:.2} KB", v as f64 / KB),
         _ => format!("{} B", value),
     }
+}
+
+fn value_to_datetime(value: &Option<Value>) -> Option<DateTime<Utc>> {
+    let millis = value.as_ref().and_then(|v| match v {
+        Value::Number(num) => num.as_u64().map(|v| v as u128),
+        Value::String(raw) => raw.parse::<u128>().ok(),
+        _ => None,
+    })?;
+    millis_to_datetime(millis)
+}
+
+fn millis_to_datetime(ms: u128) -> Option<DateTime<Utc>> {
+    let seconds = (ms / 1_000) as i64;
+    let nanos = ((ms % 1_000) as u32) * 1_000_000;
+    Utc.timestamp_opt(seconds, nanos).single()
 }
 
 #[allow(dead_code)]
@@ -469,6 +594,42 @@ struct RpcPeerStatus {
     reputation: Option<f64>,
     #[serde(default)]
     geography: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Default)]
+struct ConsensusTelemetryResponse {
+    #[serde(default)]
+    commerce_height: u64,
+    #[serde(default)]
+    security_height: u64,
+    #[serde(default)]
+    pending_commerce_blocks: usize,
+    #[serde(default)]
+    delayed_finality_queue_depth: u64,
+    #[serde(default)]
+    last_security_commit: u64,
+    #[serde(default)]
+    instant_finality_rate: f64,
+    #[serde(default)]
+    timestamp_ms: Option<Value>,
+    #[serde(default)]
+    latest_finalized_block: Option<FinalizedBlockTelemetry>,
+    #[serde(default)]
+    proposer_reputation_score: Option<f64>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Default)]
+struct FinalizedBlockTelemetry {
+    #[serde(default)]
+    hash: String,
+    #[serde(default)]
+    round: u64,
+    #[serde(default)]
+    finalized_at_ms: Option<Value>,
+    #[serde(default)]
+    signature_count: usize,
 }
 
 async fn check_network_health(services: bool, report: bool, _config: &Config) -> Result<()> {

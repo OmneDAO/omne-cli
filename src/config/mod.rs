@@ -1,8 +1,14 @@
 //! Configuration management for Omne CLI
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use serde_json::{Map as JsonMap, Value as JsonValue};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
+use tokio::fs;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,33 +146,27 @@ impl Default for Config {
 pub async fn load_config(config_path: Option<&str>, network: &str) -> Result<Config> {
     let mut config = Config::default();
 
-    // Update network configuration based on network parameter
-    match network {
-        "mainnet" => {
-            config.network.name = "mainnet".to_string();
-            config.network.chain_id = 1337;
-            config.network.rpc_endpoint = "https://rpc.omne.network".to_string();
-            config.network.ws_endpoint = "wss://ws.omne.network".to_string();
-            config.network.explorer_url = "https://explorer.omne.network".to_string();
-        }
-        "devnet" => {
-            config.network.name = "devnet".to_string();
-            config.network.chain_id = 1339;
-            config.network.rpc_endpoint = "http://localhost:8545".to_string();
-            config.network.ws_endpoint = "ws://localhost:8546".to_string();
-            config.network.explorer_url = "http://localhost:3000".to_string();
-        }
-        _ => {
-            // Default testnet configuration is already set
+    // Apply network preset before loading any custom configuration so overrides can mutate it.
+    apply_network_preset(&mut config, network);
+
+    if let Some(path) = config_path {
+        if let Some(custom_value) = load_config_value(path).await? {
+            let mut base_value = serde_json::to_value(&config)
+                .context("failed to serialise default configuration")?;
+            merge_values(&mut base_value, custom_value, path);
+
+            config = serde_json::from_value(base_value)
+                .context("failed to apply custom configuration overrides")?;
+
+            info!("Configuration merged from {}", path);
         }
     }
 
-    if let Some(path) = config_path {
-        info!("Loading configuration from: {}", path);
-
-        // In a real implementation, we would load and merge the configuration file
-        // For now, we'll just log that we would load it
-        warn!("Custom configuration loading not implemented yet");
+    if let Err(err) = validate_network_endpoints(&config).await {
+        warn!(
+            "Configuration RPC endpoint validation failed for {}: {}",
+            config.network.rpc_endpoint, err
+        );
     }
 
     info!("Configuration loaded for {} network", config.network.name);
@@ -192,4 +192,129 @@ pub fn get_data_dir() -> Result<PathBuf> {
 
     std::fs::create_dir_all(&data_dir)?;
     Ok(data_dir)
+}
+
+fn apply_network_preset(config: &mut Config, network: &str) {
+    match network {
+        "mainnet" => {
+            config.network.name = "mainnet".to_string();
+            config.network.chain_id = 1337;
+            config.network.rpc_endpoint = "https://rpc.omne.network".to_string();
+            config.network.ws_endpoint = "wss://ws.omne.network".to_string();
+            config.network.explorer_url = "https://explorer.omne.network".to_string();
+        }
+        "devnet" => {
+            config.network.name = "devnet".to_string();
+            config.network.chain_id = 1339;
+            config.network.rpc_endpoint = "http://localhost:8545".to_string();
+            config.network.ws_endpoint = "ws://localhost:8546".to_string();
+            config.network.explorer_url = "http://localhost:3000".to_string();
+        }
+        _ => {
+            // Default testnet configuration is already set
+        }
+    }
+}
+
+async fn load_config_value(path: &str) -> Result<Option<JsonValue>> {
+    let content = match fs::read_to_string(path).await {
+        Ok(data) => data,
+        Err(err) => {
+            warn!("Failed to read config file {}: {}", path, err);
+            return Ok(None);
+        }
+    };
+
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let value = match extension.as_str() {
+        "json" => {
+            serde_json::from_str::<JsonValue>(&content).context("invalid JSON configuration")?
+        }
+        "yaml" | "yml" => {
+            let yaml: serde_yaml::Value =
+                serde_yaml::from_str(&content).context("invalid YAML configuration")?;
+            serde_json::to_value(yaml).context("failed to convert YAML to JSON value")?
+        }
+        "toml" | "" => {
+            let toml_value: toml::Value =
+                toml::from_str(&content).context("invalid TOML configuration")?;
+            serde_json::to_value(toml_value).context("failed to convert TOML to JSON value")?
+        }
+        other => {
+            warn!(
+                "Unsupported config extension '{}' for {}, expected toml/yaml/json",
+                other, path
+            );
+            return Ok(None);
+        }
+    };
+
+    Ok(Some(value))
+}
+
+fn merge_values(base: &mut JsonValue, patch: JsonValue, origin: &str) {
+    match (base, patch) {
+        (JsonValue::Object(base_map), JsonValue::Object(patch_map)) => {
+            report_unknown_keys(base_map, &patch_map, origin);
+            for (key, value) in patch_map {
+                merge_values(
+                    base_map.entry(key).or_insert(JsonValue::Null),
+                    value,
+                    origin,
+                );
+            }
+        }
+        (base_slot, patch_value) => {
+            *base_slot = patch_value;
+        }
+    }
+}
+
+fn report_unknown_keys(
+    base: &JsonMap<String, JsonValue>,
+    patch: &JsonMap<String, JsonValue>,
+    origin: &str,
+) {
+    for key in patch.keys() {
+        if !base.contains_key(key) {
+            warn!("Ignoring unknown configuration key '{}' in {}", key, origin);
+        }
+    }
+}
+
+async fn validate_network_endpoints(config: &Config) -> Result<()> {
+    probe_rpc_endpoint(&config.network.rpc_endpoint).await
+}
+
+/// Probe the configured RPC endpoint and return an error if it is unreachable.
+pub async fn probe_rpc_endpoint(endpoint: &str) -> Result<()> {
+    if !endpoint.starts_with("http") {
+        return Ok(());
+    }
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .context("unable to build HTTP client for validation")?;
+
+    let response = client
+        .get(endpoint)
+        .send()
+        .await
+        .with_context(|| format!("failed to reach RPC endpoint {}", endpoint))?;
+
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "RPC endpoint {} responded with status {}",
+            endpoint,
+            response.status()
+        );
+    }
+
+    Ok(())
 }
