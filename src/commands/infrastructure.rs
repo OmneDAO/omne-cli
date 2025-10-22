@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::utils::spinner;
 use anyhow::Result;
 use clap::Subcommand;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Subcommand)]
 pub enum InfrastructureCommands {
@@ -108,6 +108,13 @@ pub enum PaymasterCommands {
 }
 
 pub async fn execute(command: InfrastructureCommands, config: &Config) -> Result<()> {
+    if let Err(err) = crate::config::probe_rpc_endpoint(&config.network.rpc_endpoint).await {
+        warn!(
+            "Unable to reach infrastructure RPC endpoint at {}: {}. Continuing with cached metrics where available.",
+            config.network.rpc_endpoint, err
+        );
+    }
+
     match command {
         InfrastructureCommands::Omp { action } => manage_omp(action, config).await,
         InfrastructureCommands::Orc20 { action } => manage_orc20(action, config).await,

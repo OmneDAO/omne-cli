@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::utils::{confirm, spinner};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use clap::Subcommand;
 use reqwest::Client;
@@ -150,6 +150,17 @@ pub enum ChallengeCommands {
 }
 
 pub async fn execute(command: ValidatorCommands, config: &Config) -> Result<()> {
+    if requires_rpc(&command) {
+        crate::config::probe_rpc_endpoint(&config.network.rpc_endpoint)
+            .await
+            .with_context(|| {
+                format!(
+                    "Unable to reach validator RPC endpoint at {}",
+                    config.network.rpc_endpoint
+                )
+            })?;
+    }
+
     match command {
         ValidatorCommands::Init { data_dir, services } => {
             init_validator(&data_dir, &services, config).await
@@ -167,6 +178,17 @@ pub async fn execute(command: ValidatorCommands, config: &Config) -> Result<()> 
         ValidatorCommands::Challenges { action } => handle_challenges(action, config).await,
         ValidatorCommands::Status { services } => show_validator_status(services, config).await,
     }
+}
+
+fn requires_rpc(command: &ValidatorCommands) -> bool {
+    matches!(
+        command,
+        ValidatorCommands::Stake { .. }
+            | ValidatorCommands::Services { .. }
+            | ValidatorCommands::Earnings { .. }
+            | ValidatorCommands::Challenges { .. }
+            | ValidatorCommands::Status { .. }
+    )
 }
 
 async fn init_validator(data_dir: &str, services: &[String], _config: &Config) -> Result<()> {
