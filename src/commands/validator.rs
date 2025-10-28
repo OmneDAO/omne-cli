@@ -783,15 +783,12 @@ impl fmt::Display for ChallengeResolution {
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcResponse<T> {
-    jsonrpc: Option<String>,
     result: Option<T>,
     error: Option<JsonRpcError>,
-    id: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcError {
     code: i32,
     message: String,
-    data: Option<Value>,
 }
