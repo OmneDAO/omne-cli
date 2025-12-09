@@ -80,6 +80,8 @@ features = ["alloc"]
 tempfile = "3.8"
 assert_cmd = "2.0"
 predicates = "3.0"
+httptest = "0.15"
+wat = "1.0"
 
 [profile.release]
 lto = true
