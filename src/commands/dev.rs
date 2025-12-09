@@ -15,7 +15,10 @@ use clap::{Subcommand, ValueEnum};
 use dialoguer::Select;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use hex;
 use serde_json::{self, json, Value as JsonValue};
+use rand::rngs::OsRng;
+use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -84,6 +87,7 @@ struct PlanContract {
     wasm_size_bytes: usize,
     wasm_sha256: String,
     wasm_base64: String,
+    deployment_nonce: String,
     entry: PlanEntry,
     metadata: PlanContractMetadata,
 }
@@ -723,6 +727,10 @@ fn build_execution_plan(
     let wasm_base64 = Base64::encode_string(module.bytes());
     let wasm_sha256 = format!("{:x}", Sha256::digest(module.bytes()));
 
+    let mut nonce_bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let deployment_nonce = hex::encode(nonce_bytes);
+
     Ok(ExecutionPlan {
         generated_at: Utc::now().to_rfc3339(),
         network: PlanNetwork {
@@ -737,6 +745,7 @@ fn build_execution_plan(
             wasm_size_bytes: module.bytes().len(),
             wasm_sha256,
             wasm_base64,
+            deployment_nonce,
             entry: PlanEntry {
                 contract: method.contract.clone(),
                 function: method.function.clone(),
