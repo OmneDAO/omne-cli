@@ -13,6 +13,7 @@ use tracing::{error, info};
 mod commands;
 mod config;
 mod utils;
+mod wasm;
 
 use commands::{
     dev::DevCommands, infrastructure::InfrastructureCommands, network::NetworkCommands,

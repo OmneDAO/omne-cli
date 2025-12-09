@@ -2,10 +2,123 @@
 
 use crate::config::Config;
 use crate::utils::{confirm, spinner};
-use anyhow::Result;
-use clap::Subcommand;
-use std::path::Path;
+use crate::wasm;
+use anyhow::{anyhow, bail, Context, Result};
+use axiom_runtime::{
+    AxiomEngine, ExecutionConfig as RuntimeExecutionConfig, ExecutionResult, COMPUTEVM_GAS_LIMIT,
+    COMPUTEVM_TIMEOUT_US, FASTVM_GAS_LIMIT, FASTVM_TIMEOUT_US, STANDARDVM_GAS_LIMIT,
+    STANDARDVM_TIMEOUT_US,
+};
+use base64ct::{Base64, Encoding};
+use chrono::Utc;
+use clap::{Subcommand, ValueEnum};
+use dialoguer::Select;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::{self, json, Value as JsonValue};
+use sha2::{Digest, Sha256};
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tokio::fs;
 use tracing::{info, warn};
+
+#[derive(Clone, Debug, ValueEnum)]
+pub enum DeployTier {
+    Fastvm,
+    Standard,
+    Compute,
+}
+
+impl DeployTier {
+    fn as_str(&self) -> &'static str {
+        match self {
+            DeployTier::Fastvm => "fastvm",
+            DeployTier::Standard => "standard",
+            DeployTier::Compute => "compute",
+        }
+    }
+
+    fn build_execution_config(&self, contract: &str, function: &str) -> RuntimeExecutionConfig {
+        match self {
+            DeployTier::Fastvm => RuntimeExecutionConfig::contract_entry(contract, function)
+                .with_gas_limit(FASTVM_GAS_LIMIT)
+                .with_timeout(Duration::from_micros(FASTVM_TIMEOUT_US)),
+            DeployTier::Standard => RuntimeExecutionConfig::contract_entry(contract, function)
+                .with_gas_limit(STANDARDVM_GAS_LIMIT)
+                .with_timeout(Duration::from_micros(STANDARDVM_TIMEOUT_US)),
+            DeployTier::Compute => RuntimeExecutionConfig::contract_entry(contract, function)
+                .with_gas_limit(COMPUTEVM_GAS_LIMIT)
+                .with_timeout(Duration::from_micros(COMPUTEVM_TIMEOUT_US)),
+        }
+    }
+}
+
+impl fmt::Display for DeployTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ExecutionPlan {
+    generated_at: String,
+    network: PlanNetwork,
+    contract: PlanContract,
+    execution: PlanExecution,
+    services: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PlanNetwork {
+    name: String,
+    chain_id: u64,
+    rpc_endpoint: String,
+    ws_endpoint: String,
+    explorer_url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PlanContract {
+    path: String,
+    wasm_size_bytes: usize,
+    wasm_sha256: String,
+    wasm_base64: String,
+    entry: PlanEntry,
+    metadata: PlanContractMetadata,
+}
+
+#[derive(Debug, Serialize)]
+struct PlanContractMetadata {
+    has_axiom_entry_main: bool,
+    has_legacy_entry_main: bool,
+    methods: Vec<wasm::ContractMethod>,
+}
+
+#[derive(Debug, Serialize)]
+struct PlanEntry {
+    contract: String,
+    function: String,
+    selector: String,
+    export: String,
+    legacy_export: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PlanExecution {
+    tier: String,
+    config: RuntimeExecutionConfig,
+    preview: ExecutionResult,
+    preview_summary: ExecutionPreviewSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecutionPreviewSummary {
+    execution_time_ms: u128,
+    gas_consumed: u64,
+    return_value: Option<axiom_runtime::execution::SerializableVal>,
+    deterministic_state: String,
+}
 
 #[derive(Subcommand)]
 pub enum DevCommands {
@@ -44,6 +157,14 @@ pub enum DevCommands {
         #[arg(long)]
         contract: Option<String>,
 
+        /// Contract entry selector (Contract::function)
+        #[arg(long)]
+        entry: Option<String>,
+
+        /// Output path for generated execution plan
+        #[arg(long)]
+        plan: Option<String>,
+
         /// Enable infrastructure services
         #[arg(long)]
         services: Vec<String>,
@@ -51,6 +172,10 @@ pub enum DevCommands {
         /// Target network
         #[arg(long, default_value = "testnet")]
         network: String,
+
+        /// Execution tier for generated config
+        #[arg(long, value_enum, default_value = "standard")]
+        tier: DeployTier,
     },
 
     /// SDK management
@@ -124,9 +249,23 @@ pub async fn execute(command: DevCommands, config: &Config) -> Result<()> {
         } => run_tests(integration, performance, component.as_deref(), config).await,
         DevCommands::Deploy {
             contract,
+            entry,
+            plan,
             services,
             network,
-        } => deploy_project(contract.as_deref(), &services, &network, config).await,
+            tier,
+        } => {
+            deploy_project(
+                contract.as_deref(),
+                entry.as_deref(),
+                plan.as_deref(),
+                tier,
+                &services,
+                &network,
+                config,
+            )
+            .await
+        }
         DevCommands::Sdk { action } => manage_sdk(action, config).await,
         DevCommands::Local { action } => manage_local_env(action, config).await,
     }
@@ -217,9 +356,12 @@ async fn run_tests(
 
 async fn deploy_project(
     contract: Option<&str>,
+    entry: Option<&str>,
+    plan: Option<&str>,
+    tier: DeployTier,
     services: &[String],
     network: &str,
-    _config: &Config,
+    config: &Config,
 ) -> Result<()> {
     info!("🚀 Deploying to Omne {} network", network);
 
@@ -230,10 +372,177 @@ async fn deploy_project(
 
     if let Some(contract_path) = contract {
         info!("📦 Deploying contract: {}", contract_path);
-        let progress = spinner("Compiling and uploading WASM...");
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-        progress.finish_with_message("✅ Contract deployed");
-        println!("   Contract Address: omne1contract123456789...");
+        let analysis = spinner("Analyzing contract module...");
+        let module = wasm::load_contract_module(contract_path).await?;
+        let metadata = module.metadata();
+        analysis.finish_with_message("✅ Contract module analyzed");
+
+        if !metadata.has_runtime_entry() {
+            warn!(
+                "Contract module is missing '{}' export; runtime tooling expects the ABI entry point.",
+                axiom_runtime::abi::ENTRY_EXPORT
+            );
+        }
+
+        if metadata.has_legacy_entry() {
+            info!(
+                "   Legacy entry export '{}' retained for compatibility",
+                axiom_runtime::abi::LEGACY_ENTRY_EXPORT
+            );
+        }
+
+        info!("   Discovered contract exports:");
+        for method in metadata.contract_methods() {
+            let mut details = format!("     - {} (export: {})", method.selector(), method.export);
+            if method.has_legacy_export {
+                if let Some(legacy) = &method.legacy_export {
+                    details.push_str(&format!(", legacy alias: {}", legacy));
+                }
+            }
+            info!("{}", details);
+        }
+
+        let methods = metadata.contract_methods();
+        let selected_method = if let Some(selector) = entry {
+            metadata
+                .resolve_method(selector)
+                .ok_or_else(|| anyhow!("no contract export named '{}' found", selector))?
+        } else if let Some(default) = metadata.default_method() {
+            default
+        } else {
+            let options: Vec<String> = methods
+                .iter()
+                .map(|method| format!("{} (export: {})", method.selector(), method.export))
+                .collect();
+            match Select::new()
+                .with_prompt("Select contract export to deploy")
+                .items(&options)
+                .default(0)
+                .interact_opt()
+            {
+                Ok(Some(index)) => methods.get(index).ok_or_else(|| {
+                    anyhow!(
+                        "invalid export selection index {} returned by selector",
+                        index
+                    )
+                })?,
+                Ok(None) => bail!("contract export selection cancelled"),
+                Err(err) => bail!(
+                    "unable to interactively select contract export: {} (pass --entry <Contract::function>)",
+                    err
+                ),
+            }
+        };
+
+        let selected_selector = selected_method.selector();
+        let selected_contract = selected_method.contract.clone();
+        let selected_function = selected_method.function.clone();
+        let selected_export = selected_method.export.clone();
+        let selected_legacy = selected_method.legacy_export.clone();
+        let selected_has_legacy = selected_method.has_legacy_export;
+
+        let exec_config = tier.build_execution_config(&selected_contract, &selected_function);
+
+        info!(
+            "   Contract entry resolved: {} (export {})",
+            selected_selector, selected_export
+        );
+        if selected_has_legacy {
+            if let Some(ref legacy) = selected_legacy {
+                info!("   Legacy export retained as {}", legacy);
+            }
+        }
+        info!("   Execution tier: {}", tier);
+
+        let engine = create_engine(&tier)?;
+        let execution_preview = engine
+            .execute(module.bytes(), exec_config.clone())
+            .map_err(|err| anyhow!("contract execution preview failed: {}", err))?;
+        let preview_summary = ExecutionPreviewSummary {
+            execution_time_ms: execution_preview.execution_time.as_millis(),
+            gas_consumed: execution_preview.gas_consumed,
+            return_value: execution_preview.return_value.clone(),
+            deterministic_state: execution_preview.deterministic_state.clone(),
+        };
+
+        info!(
+            "   Preview return value: {:?}",
+            execution_preview.return_value
+        );
+        info!(
+            "   Preview execution time: {} ms",
+            preview_summary.execution_time_ms
+        );
+
+        let plan_path = plan
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(contract_path).with_extension("execution.json"));
+
+        let wasm_base64 = Base64::encode_string(module.bytes());
+        let wasm_sha256 = format!("{:x}", Sha256::digest(module.bytes()));
+
+        let execution_plan = ExecutionPlan {
+            generated_at: Utc::now().to_rfc3339(),
+            network: PlanNetwork {
+                name: config.network.name.clone(),
+                chain_id: config.network.chain_id,
+                rpc_endpoint: config.network.rpc_endpoint.clone(),
+                ws_endpoint: config.network.ws_endpoint.clone(),
+                explorer_url: config.network.explorer_url.clone(),
+            },
+            contract: PlanContract {
+                path: module.path().display().to_string(),
+                wasm_size_bytes: module.bytes().len(),
+                wasm_sha256,
+                wasm_base64,
+                entry: PlanEntry {
+                    contract: selected_contract.clone(),
+                    function: selected_function.clone(),
+                    selector: selected_selector.clone(),
+                    export: selected_export.clone(),
+                    legacy_export: selected_legacy.clone(),
+                },
+                metadata: PlanContractMetadata {
+                    has_axiom_entry_main: metadata.has_runtime_entry(),
+                    has_legacy_entry_main: metadata.has_legacy_entry(),
+                    methods: methods.to_vec(),
+                },
+            },
+            execution: PlanExecution {
+                tier: tier.as_str().to_string(),
+                config: exec_config.clone(),
+                preview: execution_preview.clone(),
+                preview_summary,
+            },
+            services: services.to_vec(),
+        };
+
+        let plan_bytes = serde_json::to_vec_pretty(&execution_plan)?;
+        fs::write(&plan_path, plan_bytes).await?;
+
+        info!("   Execution plan written to {}", plan_path.display());
+        println!("   Plan file: {}", plan_path.display());
+
+        let submission = spinner("Submitting execution plan to network...");
+        match submit_execution_plan(&execution_plan, config).await {
+            Ok(Some(result)) => {
+                submission.finish_with_message("✅ Execution plan submitted");
+                if let Some(address) = extract_contract_address(&result) {
+                    info!("   Contract Address: {}", address);
+                    println!("   Contract Address: {}", address);
+                } else {
+                    info!("   Deployment response: {}", result);
+                }
+            }
+            Ok(None) => {
+                submission.finish_with_message("✅ Execution plan submitted");
+                info!("   Deployment endpoint returned no additional data");
+            }
+            Err(err) => {
+                submission.finish_with_message("⚠️ Failed to submit execution plan");
+                warn!("Execution plan submission failed: {}", err);
+            }
+        }
     }
 
     if !services.is_empty() {
@@ -355,4 +664,110 @@ async fn manage_local_env(action: LocalCommands, _config: &Config) -> Result<()>
         }
     }
     Ok(())
+}
+
+fn create_engine(tier: &DeployTier) -> Result<AxiomEngine> {
+    let engine = match tier {
+        DeployTier::Fastvm => AxiomEngine::new_fastvm(),
+        DeployTier::Standard => AxiomEngine::new_standardvm(),
+        DeployTier::Compute => AxiomEngine::new_computevm(),
+    };
+
+    engine.map_err(|err| anyhow!("failed to initialise {} engine: {}", tier, err))
+}
+
+async fn submit_execution_plan(plan: &ExecutionPlan, config: &Config) -> Result<Option<JsonValue>> {
+    let endpoint = &config.network.rpc_endpoint;
+    if !endpoint.starts_with("http") {
+        bail!(
+            "RPC endpoint {} is not HTTP(S); unable to submit execution plan",
+            endpoint
+        );
+    }
+
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "method": "omne_deployContract",
+        "params": [plan],
+        "id": 1,
+    });
+
+    let client = Client::new();
+    let response = client
+        .post(endpoint)
+        .json(&payload)
+        .send()
+        .await
+        .with_context(|| format!("failed to submit execution plan to {}", endpoint))?;
+
+    let status = response.status();
+    let envelope: JsonRpcEnvelope = response
+        .json()
+        .await
+        .with_context(|| format!("failed to decode deployment response from {}", endpoint))?;
+
+    if let Some(error) = envelope.error {
+        let data = error
+            .data
+            .as_ref()
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+
+        if status.is_success() {
+            if data.is_empty() {
+                bail!("RPC error {}: {}", error.code, error.message);
+            } else {
+                bail!("RPC error {}: {} ({})", error.code, error.message, data);
+            }
+        } else if data.is_empty() {
+            bail!(
+                "deployment endpoint {} returned status {}: {} ({})",
+                endpoint,
+                status,
+                error.message,
+                error.code
+            );
+        } else {
+            bail!(
+                "deployment endpoint {} returned status {}: {} ({}, {})",
+                endpoint,
+                status,
+                error.message,
+                error.code,
+                data
+            );
+        }
+    }
+
+    if !status.is_success() {
+        bail!(
+            "deployment endpoint {} returned status {} without error payload",
+            endpoint,
+            status
+        );
+    }
+
+    Ok(envelope.result)
+}
+
+fn extract_contract_address(result: &JsonValue) -> Option<&str> {
+    result
+        .get("contractAddress")
+        .or_else(|| result.get("contract_address"))
+        .or_else(|| result.get("address"))
+        .and_then(|value| value.as_str())
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcEnvelope {
+    result: Option<JsonValue>,
+    error: Option<JsonRpcError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcError {
+    code: i64,
+    message: String,
+    #[serde(default)]
+    data: Option<JsonValue>,
 }
