@@ -10,15 +10,17 @@ use axiom_runtime::{
     STANDARDVM_TIMEOUT_US,
 };
 use base64ct::{Base64, Encoding};
+use bincode;
 use chrono::Utc;
 use clap::{Subcommand, ValueEnum};
 use dialoguer::Select;
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use ed25519_dalek::{Signer, SigningKey};
 use hex;
-use serde_json::{self, json, Value as JsonValue};
 use rand::rngs::OsRng;
 use rand::RngCore;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::{self, json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -65,11 +67,15 @@ impl fmt::Display for DeployTier {
 
 #[derive(Debug, Serialize)]
 struct ExecutionPlan {
-    generated_at: String,
-    network: PlanNetwork,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network: Option<PlanNetwork>,
     contract: PlanContract,
     execution: PlanExecution,
     services: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<PlanSignature>,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,13 +89,15 @@ struct PlanNetwork {
 
 #[derive(Debug, Serialize)]
 struct PlanContract {
-    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
     wasm_size_bytes: usize,
     wasm_sha256: String,
     wasm_base64: String,
     deployment_nonce: String,
     entry: PlanEntry,
-    metadata: PlanContractMetadata,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<PlanContractMetadata>,
 }
 
 #[derive(Debug, Serialize)]
@@ -112,8 +120,10 @@ struct PlanEntry {
 struct PlanExecution {
     tier: String,
     config: RuntimeExecutionConfig,
-    preview: ExecutionResult,
-    preview_summary: ExecutionPreviewSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview: Option<ExecutionResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview_summary: Option<ExecutionPreviewSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +132,13 @@ struct ExecutionPreviewSummary {
     gas_consumed: u64,
     return_value: Option<axiom_runtime::execution::SerializableVal>,
     deterministic_state: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct PlanSignature {
+    algorithm: String,
+    public_key_hex: String,
+    signature_hex: String,
 }
 
 #[derive(Subcommand)]
@@ -180,6 +197,10 @@ pub enum DevCommands {
         /// Execution tier for generated config
         #[arg(long, value_enum, default_value = "standard")]
         tier: DeployTier,
+
+        /// Path to Ed25519 signing key (hex-encoded) for execution plan attestation
+        #[arg(long)]
+        signing_key: Option<String>,
     },
 
     /// SDK management
@@ -258,6 +279,7 @@ pub async fn execute(command: DevCommands, config: &Config) -> Result<()> {
             services,
             network,
             tier,
+            signing_key,
         } => {
             deploy_project(
                 contract.as_deref(),
@@ -266,6 +288,7 @@ pub async fn execute(command: DevCommands, config: &Config) -> Result<()> {
                 tier,
                 &services,
                 &network,
+                signing_key.as_deref(),
                 config,
             )
             .await
@@ -365,6 +388,7 @@ async fn deploy_project(
     tier: DeployTier,
     services: &[String],
     network: &str,
+    signing_key: Option<&str>,
     config: &Config,
 ) -> Result<()> {
     info!("🚀 Deploying to Omne {} network", network);
@@ -457,17 +481,22 @@ async fn deploy_project(
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(contract_path).with_extension("execution.json"));
 
-        let execution_plan =
+        let mut execution_plan =
             build_execution_plan(&module, selected_method, tier.clone(), services, config)?;
 
-        info!(
-            "   Preview return value: {:?}",
-            execution_plan.execution.preview.return_value
-        );
-        info!(
-            "   Preview execution time: {} ms",
-            execution_plan.execution.preview_summary.execution_time_ms
-        );
+        if let Some(key_path) = signing_key {
+            sign_execution_plan(&mut execution_plan, key_path).await?;
+        }
+
+        if let Some(preview) = execution_plan.execution.preview.as_ref() {
+            info!("   Preview return value: {:?}", preview.return_value);
+        }
+        if let Some(summary) = execution_plan.execution.preview_summary.as_ref() {
+            info!(
+                "   Preview execution time: {} ms",
+                summary.execution_time_ms
+            );
+        }
 
         let plan_bytes = serde_json::to_vec_pretty(&execution_plan)?;
         fs::write(&plan_path, plan_bytes).await?;
@@ -732,16 +761,16 @@ fn build_execution_plan(
     let deployment_nonce = hex::encode(nonce_bytes);
 
     Ok(ExecutionPlan {
-        generated_at: Utc::now().to_rfc3339(),
-        network: PlanNetwork {
+        generated_at: Some(Utc::now().to_rfc3339()),
+        network: Some(PlanNetwork {
             name: config.network.name.clone(),
             chain_id: config.network.chain_id,
             rpc_endpoint: config.network.rpc_endpoint.clone(),
             ws_endpoint: config.network.ws_endpoint.clone(),
             explorer_url: config.network.explorer_url.clone(),
-        },
+        }),
         contract: PlanContract {
-            path: module.path().display().to_string(),
+            path: Some(module.path().display().to_string()),
             wasm_size_bytes: module.bytes().len(),
             wasm_sha256,
             wasm_base64,
@@ -753,20 +782,83 @@ fn build_execution_plan(
                 export: method.export.clone(),
                 legacy_export: method.legacy_export.clone(),
             },
-            metadata: PlanContractMetadata {
+            metadata: Some(PlanContractMetadata {
                 has_axiom_entry_main: metadata.has_runtime_entry(),
                 has_legacy_entry_main: metadata.has_legacy_entry(),
                 methods: metadata.contract_methods().to_vec(),
-            },
+            }),
         },
         execution: PlanExecution {
             tier: tier.as_str().to_string(),
             config: exec_config,
-            preview: execution_preview,
-            preview_summary,
+            preview: Some(execution_preview),
+            preview_summary: Some(preview_summary),
         },
         services: services.to_vec(),
+        signature: None,
     })
+}
+
+async fn sign_execution_plan(plan: &mut ExecutionPlan, key_path: &str) -> Result<()> {
+    let raw = fs::read(key_path)
+        .await
+        .with_context(|| format!("failed to read signing key from {}", key_path))?;
+
+    let secret_bytes = if raw.len() == 32 {
+        raw
+    } else {
+        let key_str = String::from_utf8(raw)
+            .context("signing key file must contain raw 32-byte seed or hex-encoded secret")?;
+        let cleaned = key_str.trim();
+        if cleaned.len() == 64 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
+            hex::decode(cleaned)?
+        } else {
+            bail!("signing key must be provided as 32 raw bytes or 64 hexadecimal characters");
+        }
+    };
+
+    let secret_array: [u8; 32] = secret_bytes
+        .try_into()
+        .map_err(|_| anyhow!("signing key must decode to exactly 32 bytes"))?;
+
+    let signing_key = SigningKey::from_bytes(&secret_array);
+    let digest = compute_plan_digest(plan)?;
+    let signature = signing_key.sign(&digest);
+    let verifying_key = signing_key.verifying_key();
+
+    plan.signature = Some(PlanSignature {
+        algorithm: "ed25519".to_string(),
+        public_key_hex: hex::encode(verifying_key.to_bytes()),
+        signature_hex: hex::encode(signature.to_bytes()),
+    });
+
+    Ok(())
+}
+
+fn compute_plan_digest(plan: &ExecutionPlan) -> Result<[u8; 32]> {
+    #[derive(Serialize)]
+    struct SignatureMaterial<'a> {
+        generated_at: &'a Option<String>,
+        network: &'a Option<PlanNetwork>,
+        contract: &'a PlanContract,
+        execution: &'a PlanExecution,
+        services: &'a [String],
+    }
+
+    let material = SignatureMaterial {
+        generated_at: &plan.generated_at,
+        network: &plan.network,
+        contract: &plan.contract,
+        execution: &plan.execution,
+        services: &plan.services,
+    };
+
+    let serialized = bincode::serialize(&material)
+        .context("failed to canonicalise execution plan for signing")?;
+    let digest = Sha256::digest(&serialized);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(out)
 }
 
 fn extract_contract_address(result: &JsonValue) -> Option<&str> {
@@ -795,6 +887,7 @@ struct JsonRpcError {
 mod tests {
     use super::*;
     use axiom_runtime::execution::SerializableVal;
+    use ed25519_dalek::SigningKey;
     use httptest::{
         matchers::{all_of, matches, request},
         responders::json_encoded,
@@ -837,15 +930,57 @@ mod tests {
         )
         .expect("plan build");
 
+        let preview = plan.execution.preview.expect("preview present");
+        assert_eq!(preview.return_value, Some(SerializableVal::I64(7)));
+        let summary = plan
+            .execution
+            .preview_summary
+            .expect("preview summary present");
         assert_eq!(
-            plan.execution.preview.return_value,
-            Some(SerializableVal::I64(7))
+            summary.execution_time_ms,
+            preview.execution_time.as_millis()
         );
         assert_eq!(
-            plan.execution.preview_summary.execution_time_ms,
-            plan.execution.preview.execution_time.as_millis()
+            plan.contract
+                .metadata
+                .as_ref()
+                .expect("metadata present")
+                .methods
+                .len(),
+            1
         );
-        assert_eq!(plan.contract.metadata.methods.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn signing_attaches_plan_signature() {
+        let module = load_demo_module().await;
+        let metadata = module.metadata();
+        let method = metadata
+            .resolve_method("Demo::init")
+            .expect("method present");
+
+        let mut plan = build_execution_plan(
+            &module,
+            method,
+            DeployTier::Standard,
+            &[],
+            &Config::default(),
+        )
+        .expect("plan build");
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let mut key_file = NamedTempFile::new().expect("temp key");
+        write!(key_file, "{}", hex::encode(signing_key.to_bytes())).expect("write key");
+        let key_path = key_file.into_temp_path();
+
+        sign_execution_plan(&mut plan, key_path.to_str().unwrap())
+            .await
+            .expect("sign plan");
+
+        let signature = plan.signature.expect("signature present");
+        assert_eq!(signature.algorithm, "ed25519");
+        assert_eq!(signature.public_key_hex.len(), 64);
+        assert_eq!(signature.signature_hex.len(), 128);
     }
 
     #[tokio::test]
