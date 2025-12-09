@@ -435,87 +435,35 @@ async fn deploy_project(
         };
 
         let selected_selector = selected_method.selector();
-        let selected_contract = selected_method.contract.clone();
-        let selected_function = selected_method.function.clone();
         let selected_export = selected_method.export.clone();
-        let selected_legacy = selected_method.legacy_export.clone();
         let selected_has_legacy = selected_method.has_legacy_export;
-
-        let exec_config = tier.build_execution_config(&selected_contract, &selected_function);
 
         info!(
             "   Contract entry resolved: {} (export {})",
             selected_selector, selected_export
         );
         if selected_has_legacy {
-            if let Some(ref legacy) = selected_legacy {
+            if let Some(ref legacy) = selected_method.legacy_export {
                 info!("   Legacy export retained as {}", legacy);
             }
         }
         info!("   Execution tier: {}", tier);
 
-        let engine = create_engine(&tier)?;
-        let execution_preview = engine
-            .execute(module.bytes(), exec_config.clone())
-            .map_err(|err| anyhow!("contract execution preview failed: {}", err))?;
-        let preview_summary = ExecutionPreviewSummary {
-            execution_time_ms: execution_preview.execution_time.as_millis(),
-            gas_consumed: execution_preview.gas_consumed,
-            return_value: execution_preview.return_value.clone(),
-            deterministic_state: execution_preview.deterministic_state.clone(),
-        };
-
-        info!(
-            "   Preview return value: {:?}",
-            execution_preview.return_value
-        );
-        info!(
-            "   Preview execution time: {} ms",
-            preview_summary.execution_time_ms
-        );
-
         let plan_path = plan
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(contract_path).with_extension("execution.json"));
 
-        let wasm_base64 = Base64::encode_string(module.bytes());
-        let wasm_sha256 = format!("{:x}", Sha256::digest(module.bytes()));
+        let execution_plan =
+            build_execution_plan(&module, selected_method, tier.clone(), services, config)?;
 
-        let execution_plan = ExecutionPlan {
-            generated_at: Utc::now().to_rfc3339(),
-            network: PlanNetwork {
-                name: config.network.name.clone(),
-                chain_id: config.network.chain_id,
-                rpc_endpoint: config.network.rpc_endpoint.clone(),
-                ws_endpoint: config.network.ws_endpoint.clone(),
-                explorer_url: config.network.explorer_url.clone(),
-            },
-            contract: PlanContract {
-                path: module.path().display().to_string(),
-                wasm_size_bytes: module.bytes().len(),
-                wasm_sha256,
-                wasm_base64,
-                entry: PlanEntry {
-                    contract: selected_contract.clone(),
-                    function: selected_function.clone(),
-                    selector: selected_selector.clone(),
-                    export: selected_export.clone(),
-                    legacy_export: selected_legacy.clone(),
-                },
-                metadata: PlanContractMetadata {
-                    has_axiom_entry_main: metadata.has_runtime_entry(),
-                    has_legacy_entry_main: metadata.has_legacy_entry(),
-                    methods: methods.to_vec(),
-                },
-            },
-            execution: PlanExecution {
-                tier: tier.as_str().to_string(),
-                config: exec_config.clone(),
-                preview: execution_preview.clone(),
-                preview_summary,
-            },
-            services: services.to_vec(),
-        };
+        info!(
+            "   Preview return value: {:?}",
+            execution_plan.execution.preview.return_value
+        );
+        info!(
+            "   Preview execution time: {} ms",
+            execution_plan.execution.preview_summary.execution_time_ms
+        );
 
         let plan_bytes = serde_json::to_vec_pretty(&execution_plan)?;
         fs::write(&plan_path, plan_bytes).await?;
@@ -750,6 +698,68 @@ async fn submit_execution_plan(plan: &ExecutionPlan, config: &Config) -> Result<
     Ok(envelope.result)
 }
 
+fn build_execution_plan(
+    module: &wasm::ContractModule,
+    method: &wasm::ContractMethod,
+    tier: DeployTier,
+    services: &[String],
+    config: &Config,
+) -> Result<ExecutionPlan> {
+    let exec_config = tier.build_execution_config(&method.contract, &method.function);
+    let engine = create_engine(&tier)?;
+    let execution_preview = engine
+        .execute(module.bytes(), exec_config.clone())
+        .map_err(|err| anyhow!("contract execution preview failed: {}", err))?;
+
+    let preview_summary = ExecutionPreviewSummary {
+        execution_time_ms: execution_preview.execution_time.as_millis(),
+        gas_consumed: execution_preview.gas_consumed,
+        return_value: execution_preview.return_value.clone(),
+        deterministic_state: execution_preview.deterministic_state.clone(),
+    };
+
+    let metadata = module.metadata();
+
+    let wasm_base64 = Base64::encode_string(module.bytes());
+    let wasm_sha256 = format!("{:x}", Sha256::digest(module.bytes()));
+
+    Ok(ExecutionPlan {
+        generated_at: Utc::now().to_rfc3339(),
+        network: PlanNetwork {
+            name: config.network.name.clone(),
+            chain_id: config.network.chain_id,
+            rpc_endpoint: config.network.rpc_endpoint.clone(),
+            ws_endpoint: config.network.ws_endpoint.clone(),
+            explorer_url: config.network.explorer_url.clone(),
+        },
+        contract: PlanContract {
+            path: module.path().display().to_string(),
+            wasm_size_bytes: module.bytes().len(),
+            wasm_sha256,
+            wasm_base64,
+            entry: PlanEntry {
+                contract: method.contract.clone(),
+                function: method.function.clone(),
+                selector: method.selector(),
+                export: method.export.clone(),
+                legacy_export: method.legacy_export.clone(),
+            },
+            metadata: PlanContractMetadata {
+                has_axiom_entry_main: metadata.has_runtime_entry(),
+                has_legacy_entry_main: metadata.has_legacy_entry(),
+                methods: metadata.contract_methods().to_vec(),
+            },
+        },
+        execution: PlanExecution {
+            tier: tier.as_str().to_string(),
+            config: exec_config,
+            preview: execution_preview,
+            preview_summary,
+        },
+        services: services.to_vec(),
+    })
+}
+
 fn extract_contract_address(result: &JsonValue) -> Option<&str> {
     result
         .get("contractAddress")
@@ -770,4 +780,107 @@ struct JsonRpcError {
     message: String,
     #[serde(default)]
     data: Option<JsonValue>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axiom_runtime::execution::SerializableVal;
+    use httptest::{
+        matchers::{all_of, matches, request},
+        responders::json_encoded,
+        Expectation, Server,
+    };
+    use serde_json::json;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    use wat::parse_str;
+
+    const DEMO_WAT: &str = r#"(module
+        (func (export "axiom_contract::Demo::init") (result i64)
+            i64.const 7)
+    )"#;
+
+    async fn load_demo_module() -> wasm::ContractModule {
+        let mut file = NamedTempFile::new().expect("temp file");
+        let bytes = parse_str(DEMO_WAT).expect("valid wat");
+        file.write_all(&bytes).expect("write module");
+        let temp_path = file.into_temp_path();
+        wasm::load_contract_module(&temp_path)
+            .await
+            .expect("load contract module")
+    }
+
+    #[tokio::test]
+    async fn build_execution_plan_runs_preview() {
+        let module = load_demo_module().await;
+        let metadata = module.metadata();
+        let method = metadata
+            .resolve_method("Demo::init")
+            .expect("method present");
+
+        let plan = build_execution_plan(
+            &module,
+            method,
+            DeployTier::Standard,
+            &[],
+            &Config::default(),
+        )
+        .expect("plan build");
+
+        assert_eq!(
+            plan.execution.preview.return_value,
+            Some(SerializableVal::I64(7))
+        );
+        assert_eq!(
+            plan.execution.preview_summary.execution_time_ms,
+            plan.execution.preview.execution_time.as_millis()
+        );
+        assert_eq!(plan.contract.metadata.methods.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn submit_execution_plan_posts_to_rpc() {
+        let module = load_demo_module().await;
+        let metadata = module.metadata();
+        let method = metadata
+            .resolve_method("Demo::init")
+            .expect("method present");
+
+        let mut server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("POST", "/"),
+                request::body(matches("\"method\":\"omne_deployContract\"")),
+                request::body(matches("Demo::init"))
+            ])
+            .respond_with(json_encoded(json!({
+                "jsonrpc": "2.0",
+                "result": { "contractAddress": "omne1deadbeef" },
+                "id": 1
+            }))),
+        );
+
+        let mut config = Config::default();
+        config.network.rpc_endpoint = server.url("/").to_string();
+        config.network.ws_endpoint = "ws://test".to_string();
+        config.network.explorer_url = "http://test".to_string();
+
+        let plan = build_execution_plan(&module, method, DeployTier::Standard, &[], &config)
+            .expect("plan build");
+
+        let response = submit_execution_plan(&plan, &config)
+            .await
+            .expect("submission succeeds");
+
+        let payload = response.expect("deployment result");
+        assert_eq!(
+            payload
+                .get("contractAddress")
+                .and_then(|value| value.as_str()),
+            Some("omne1deadbeef")
+        );
+
+        server.verify_and_clear();
+    }
 }
