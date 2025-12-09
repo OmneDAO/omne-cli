@@ -30,6 +30,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 
+# Hashing
+sha2 = "0.10"
+
 # Error handling
 anyhow = "1.0"
 thiserror = "1.0"
@@ -61,10 +64,17 @@ rand = "0.8"
 # Network utilities
 url = "2.4"
 
+# WASM contract inspection
+wasmparser = "0.243.0"
+
+# Runtime integration helpers
+axiom-runtime = { path = "../axiom-runtime/crates/axiom-runtime" }
+
 # Remove OpenSSL dependency by using pure Rust crypto
 # Force compatible base64ct version to avoid edition2024 requirement
 [dependencies.base64ct]
 version = "=1.6.0"
+features = ["alloc"]
 
 [dev-dependencies]
 tempfile = "3.8"
