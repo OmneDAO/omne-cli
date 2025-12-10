@@ -1,6 +1,7 @@
 //! Configuration management for Omne CLI
 
 use anyhow::{Context, Result};
+use deploy_guardrails::signers_vec_for_network;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -29,6 +30,8 @@ pub struct NetworkConfig {
     pub explorer_url: String,
     #[serde(default)]
     pub allowed_services: Vec<String>,
+    #[serde(default)]
+    pub allowed_signers: Vec<String>,
     #[serde(default)]
     pub auth_token: Option<String>,
     #[serde(default)]
@@ -104,6 +107,7 @@ impl Default for Config {
                 ws_endpoint: "wss://testnet-ws.omne.network".to_string(),
                 explorer_url: "https://testnet-explorer.omne.network".to_string(),
                 allowed_services: vec!["orchestrator".to_string(), "analytics".to_string()],
+                allowed_signers: signers_vec_for_network("testnet"),
                 auth_token: None,
                 rate_limit_per_minute: Some(60),
             },
@@ -216,6 +220,7 @@ fn apply_network_preset(config: &mut Config, network: &str) {
                 "analytics".to_string(),
                 "security".to_string(),
             ];
+            config.network.allowed_signers = signers_vec_for_network("mainnet");
             config.network.rate_limit_per_minute = Some(120);
         }
         "devnet" => {
@@ -225,6 +230,7 @@ fn apply_network_preset(config: &mut Config, network: &str) {
             config.network.ws_endpoint = "ws://localhost:8546".to_string();
             config.network.explorer_url = "http://localhost:3000".to_string();
             config.network.allowed_services = vec!["orchestrator".to_string()];
+            config.network.allowed_signers = signers_vec_for_network("devnet");
             config.network.rate_limit_per_minute = None;
         }
         _ => {
