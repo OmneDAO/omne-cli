@@ -71,6 +71,7 @@ wasmparser = "0.243.0"
 
 # Runtime integration helpers
 axiom-runtime = { path = "../axiom-runtime/crates/axiom-runtime" }
+deploy-guardrails = { path = "../omne-blockchain/crates/deploy-guardrails" }
 
 # Remove OpenSSL dependency by using pure Rust crypto
 # Force compatible base64ct version to avoid edition2024 requirement

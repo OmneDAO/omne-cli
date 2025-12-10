@@ -13,15 +13,17 @@ use base64ct::{Base64, Encoding};
 use bincode;
 use chrono::Utc;
 use clap::{Subcommand, ValueEnum};
+use deploy_guardrails::enforce_allowed_services;
 use dialoguer::Select;
 use ed25519_dalek::{Signer, SigningKey};
 use hex;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use reqwest::Client;
+use reqwest::{header::AUTHORIZATION, Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{self, json, Value as JsonValue};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -194,6 +196,14 @@ pub enum DevCommands {
         #[arg(long, default_value = "testnet")]
         network: String,
 
+        /// Authentication token for hardened deployment endpoint
+        #[arg(long)]
+        auth_token: Option<String>,
+
+        /// Allow services not present in the configured allow-list (unsafe)
+        #[arg(long)]
+        allow_unknown_services: bool,
+
         /// Execution tier for generated config
         #[arg(long, value_enum, default_value = "standard")]
         tier: DeployTier,
@@ -278,6 +288,8 @@ pub async fn execute(command: DevCommands, config: &Config) -> Result<()> {
             plan,
             services,
             network,
+            auth_token,
+            allow_unknown_services,
             tier,
             signing_key,
         } => {
@@ -288,6 +300,8 @@ pub async fn execute(command: DevCommands, config: &Config) -> Result<()> {
                 tier,
                 &services,
                 &network,
+                auth_token.as_deref(),
+                allow_unknown_services,
                 signing_key.as_deref(),
                 config,
             )
@@ -388,6 +402,8 @@ async fn deploy_project(
     tier: DeployTier,
     services: &[String],
     network: &str,
+    auth_token: Option<&str>,
+    allow_unknown_services: bool,
     signing_key: Option<&str>,
     config: &Config,
 ) -> Result<()> {
@@ -396,6 +412,42 @@ async fn deploy_project(
     if network == "mainnet" && !confirm("Deploy to MAINNET? This will use real funds.")? {
         info!("Deployment cancelled");
         return Ok(());
+    }
+
+    let effective_auth_token = auth_token
+        .map(|token| token.to_string())
+        .or_else(|| config.network.auth_token.clone())
+        .or_else(|| {
+            std::env::var("OMNE_AUTH_TOKEN")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        });
+
+    let service_selection = enforce_allowed_services(
+        services,
+        &config.network.allowed_services,
+        allow_unknown_services,
+    )
+    .map_err(|err| {
+        if allow_unknown_services {
+            anyhow!(err)
+        } else {
+            anyhow!("{} Pass --allow-unknown-services to override.", err)
+        }
+    })?;
+    let mut published_services = service_selection.clone();
+
+    if allow_unknown_services && !config.network.allowed_services.is_empty() {
+        warn!("Bypassing service allow-list validation; proceed with caution.");
+    } else if config.network.allowed_services.is_empty() && !service_selection.is_empty() {
+        warn!(
+            "No service allow-list configured for {}; unable to verify requested services.",
+            config.network.name
+        );
+    }
+
+    if effective_auth_token.is_some() {
+        info!("🔐 Authentication token detected; including Authorization header");
     }
 
     if let Some(contract_path) = contract {
@@ -431,6 +483,11 @@ async fn deploy_project(
         }
 
         let methods = metadata.contract_methods();
+        if methods.is_empty() {
+            bail!(
+                "contract module does not expose any ABI metadata; regenerate with the latest compiler"
+            );
+        }
         let selected_method = if let Some(selector) = entry {
             metadata
                 .resolve_method(selector)
@@ -481,8 +538,13 @@ async fn deploy_project(
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(contract_path).with_extension("execution.json"));
 
-        let mut execution_plan =
-            build_execution_plan(&module, selected_method, tier.clone(), services, config)?;
+        let mut execution_plan = build_execution_plan(
+            &module,
+            selected_method,
+            tier.clone(),
+            &service_selection,
+            config,
+        )?;
 
         if let Some(key_path) = signing_key {
             sign_execution_plan(&mut execution_plan, key_path).await?;
@@ -505,14 +567,49 @@ async fn deploy_project(
         println!("   Plan file: {}", plan_path.display());
 
         let submission = spinner("Submitting execution plan to network...");
-        match submit_execution_plan(&execution_plan, config).await {
-            Ok(Some(result)) => {
+        match submit_execution_plan(&execution_plan, config, effective_auth_token.as_deref()).await
+        {
+            Ok(Some(receipt)) => {
                 submission.finish_with_message("✅ Execution plan submitted");
-                if let Some(address) = extract_contract_address(&result) {
+                if let Some(address) = receipt.contract_address.as_deref() {
                     info!("   Contract Address: {}", address);
                     println!("   Contract Address: {}", address);
-                } else {
-                    info!("   Deployment response: {}", result);
+                }
+
+                if let Some(deployment_nonce) = receipt.deployment_nonce.as_deref() {
+                    info!("   Deployment nonce: {}", deployment_nonce);
+                }
+
+                if let Some(transaction_id) = receipt.transaction_id.as_deref() {
+                    info!("   Transaction ID: {}", transaction_id);
+                }
+
+                if let Some(signature) = receipt.plan_signature.as_ref() {
+                    if let Some(request_sig) = execution_plan.signature.as_ref() {
+                        if !plan_signatures_match(request_sig, signature) {
+                            warn!("Server rewrote plan signature; verify attestation provenance");
+                        }
+                    }
+                }
+
+                if !receipt.services.is_empty() {
+                    published_services = receipt.services.clone();
+                    info!(
+                        "   Canonical services (from network): {}",
+                        published_services.join(", ")
+                    );
+                }
+
+                let receipt_path = plan_path.with_extension("receipt.json");
+                let receipt_bytes = serde_json::to_vec_pretty(&receipt)?;
+                fs::write(&receipt_path, receipt_bytes).await?;
+                info!(
+                    "   Deployment receipt written to {}",
+                    receipt_path.display()
+                );
+
+                if let Some(raw) = receipt.extra.get("raw") {
+                    info!("   Additional deployment metadata: {}", raw);
                 }
             }
             Ok(None) => {
@@ -526,10 +623,10 @@ async fn deploy_project(
         }
     }
 
-    if !services.is_empty() {
+    if !service_selection.is_empty() {
         info!(
             "⚡ Configuring infrastructure services: {}",
-            services.join(", ")
+            service_selection.join(", ")
         );
         let progress = spinner("Setting up service integrations...");
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -538,10 +635,10 @@ async fn deploy_project(
 
     info!("✅ Deployment complete!");
     info!("   Network: {}", network);
-    let services_str = if services.is_empty() {
+    let services_str = if published_services.is_empty() {
         "None".to_string()
     } else {
-        services.join(", ")
+        published_services.join(", ")
     };
     info!("   Services: {}", services_str);
 
@@ -657,7 +754,11 @@ fn create_engine(tier: &DeployTier) -> Result<AxiomEngine> {
     engine.map_err(|err| anyhow!("failed to initialise {} engine: {}", tier, err))
 }
 
-async fn submit_execution_plan(plan: &ExecutionPlan, config: &Config) -> Result<Option<JsonValue>> {
+async fn submit_execution_plan(
+    plan: &ExecutionPlan,
+    config: &Config,
+    auth_token: Option<&str>,
+) -> Result<Option<DeploymentReceipt>> {
     let endpoint = &config.network.rpc_endpoint;
     if !endpoint.starts_with("http") {
         bail!(
@@ -674,9 +775,17 @@ async fn submit_execution_plan(plan: &ExecutionPlan, config: &Config) -> Result<
     });
 
     let client = Client::new();
-    let response = client
-        .post(endpoint)
-        .json(&payload)
+    let mut request = client.post(endpoint).json(&payload);
+
+    if let Some(token) = auth_token.map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        if token.to_ascii_lowercase().starts_with("bearer ") || token.contains(' ') {
+            request = request.header(AUTHORIZATION, token);
+        } else {
+            request = request.header(AUTHORIZATION, format!("Bearer {}", token));
+        }
+    }
+
+    let response = request
         .send()
         .await
         .with_context(|| format!("failed to submit execution plan to {}", endpoint))?;
@@ -694,7 +803,27 @@ async fn submit_execution_plan(plan: &ExecutionPlan, config: &Config) -> Result<
             .map(|value| value.to_string())
             .unwrap_or_default();
 
-        if status.is_success() {
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            if let Some(limit) = config.network.rate_limit_per_minute {
+                bail!(
+                    "deployment rejected: rate limit exceeded (limit: {} requests/min). Retry later or request a higher limit.",
+                    limit
+                );
+            } else {
+                bail!(
+                    "deployment rejected: rate limit exceeded (HTTP 429). Retry later or request a higher limit."
+                );
+            }
+        } else if status == StatusCode::FORBIDDEN {
+            if data.is_empty() {
+                bail!("deployment rejected: access forbidden (check authentication token)");
+            } else {
+                bail!(
+                    "deployment rejected: access forbidden ({}). Verify authentication token and permissions.",
+                    data
+                );
+            }
+        } else if status.is_success() {
             if data.is_empty() {
                 bail!("RPC error {}: {}", error.code, error.message);
             } else {
@@ -721,6 +850,23 @@ async fn submit_execution_plan(plan: &ExecutionPlan, config: &Config) -> Result<
     }
 
     if !status.is_success() {
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            if let Some(limit) = config.network.rate_limit_per_minute {
+                bail!(
+                    "deployment rejected: rate limit exceeded (limit: {} requests/min). Retry later or request a higher limit.",
+                    limit
+                );
+            } else {
+                bail!(
+                    "deployment rejected: rate limit exceeded (HTTP 429). Retry later or request a higher limit."
+                );
+            }
+        }
+        if status == StatusCode::FORBIDDEN {
+            bail!(
+                "deployment rejected with HTTP 403. Verify authentication token and permissions."
+            );
+        }
         bail!(
             "deployment endpoint {} returned status {} without error payload",
             endpoint,
@@ -728,7 +874,7 @@ async fn submit_execution_plan(plan: &ExecutionPlan, config: &Config) -> Result<
         );
     }
 
-    Ok(envelope.result)
+    Ok(envelope.result.map(DeploymentReceipt::from_value))
 }
 
 fn build_execution_plan(
@@ -861,12 +1007,62 @@ fn compute_plan_digest(plan: &ExecutionPlan) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-fn extract_contract_address(result: &JsonValue) -> Option<&str> {
-    result
-        .get("contractAddress")
-        .or_else(|| result.get("contract_address"))
-        .or_else(|| result.get("address"))
-        .and_then(|value| value.as_str())
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+struct DeploymentReceipt {
+    #[serde(rename = "contractAddress")]
+    contract_address: Option<String>,
+    #[serde(rename = "wasmHash")]
+    wasm_hash: Option<String>,
+    #[serde(rename = "tier")]
+    tier: Option<String>,
+    #[serde(rename = "blockHeight")]
+    block_height: Option<u64>,
+    #[serde(rename = "transactionId")]
+    transaction_id: Option<String>,
+    #[serde(rename = "deterministicState")]
+    deterministic_state: Option<String>,
+    #[serde(default)]
+    services: Vec<String>,
+    #[serde(rename = "export")]
+    export: Option<String>,
+    #[serde(rename = "deploymentNonce")]
+    deployment_nonce: Option<String>,
+    #[serde(rename = "planSignature")]
+    plan_signature: Option<ReceiptPlanSignature>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct ReceiptPlanSignature {
+    algorithm: String,
+    #[serde(rename = "publicKey")]
+    public_key: String,
+    #[serde(rename = "signature")]
+    signature: String,
+}
+
+impl DeploymentReceipt {
+    fn from_value(value: JsonValue) -> Self {
+        match serde_json::from_value::<DeploymentReceipt>(value.clone()) {
+            Ok(receipt) => receipt,
+            Err(_) => {
+                let mut fallback = DeploymentReceipt::default();
+                fallback.extra.insert("raw".to_string(), value);
+                fallback
+            }
+        }
+    }
+}
+
+fn plan_signatures_match(request: &PlanSignature, response: &ReceiptPlanSignature) -> bool {
+    request.algorithm.eq_ignore_ascii_case(&response.algorithm)
+        && request
+            .public_key_hex
+            .eq_ignore_ascii_case(&response.public_key)
+        && request
+            .signature_hex
+            .eq_ignore_ascii_case(&response.signature)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1013,18 +1209,29 @@ mod tests {
         let plan = build_execution_plan(&module, method, DeployTier::Standard, &[], &config)
             .expect("plan build");
 
-        let response = submit_execution_plan(&plan, &config)
+        let response = submit_execution_plan(&plan, &config, None)
             .await
             .expect("submission succeeds");
 
-        let payload = response.expect("deployment result");
-        assert_eq!(
-            payload
-                .get("contractAddress")
-                .and_then(|value| value.as_str()),
-            Some("omne1deadbeef")
-        );
+        let receipt = response.expect("deployment result");
+        assert_eq!(receipt.contract_address.as_deref(), Some("omne1deadbeef"));
 
         server.verify_and_clear();
+    }
+
+    #[test]
+    fn enforce_allowed_services_rejects_unknown() {
+        let requested = vec!["orchestrator".to_string(), "analytics".to_string()];
+        let allowed = vec!["orchestrator".to_string()];
+        let result = enforce_allowed_services(&requested, &allowed, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn enforce_allowed_services_deduplicates_and_canonicalises() {
+        let requested = vec!["Orchestrator".to_string(), "orchestrator".to_string()];
+        let allowed = vec!["orchestrator".to_string()];
+        let result = enforce_allowed_services(&requested, &allowed, false).expect("allowed");
+        assert_eq!(result, vec!["orchestrator".to_string()]);
     }
 }
