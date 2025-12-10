@@ -27,6 +27,12 @@ pub struct NetworkConfig {
     pub rpc_endpoint: String,
     pub ws_endpoint: String,
     pub explorer_url: String,
+    #[serde(default)]
+    pub allowed_services: Vec<String>,
+    #[serde(default)]
+    pub auth_token: Option<String>,
+    #[serde(default)]
+    pub rate_limit_per_minute: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +103,9 @@ impl Default for Config {
                 rpc_endpoint: "https://testnet-rpc.omne.network".to_string(),
                 ws_endpoint: "wss://testnet-ws.omne.network".to_string(),
                 explorer_url: "https://testnet-explorer.omne.network".to_string(),
+                allowed_services: vec!["orchestrator".to_string(), "analytics".to_string()],
+                auth_token: None,
+                rate_limit_per_minute: Some(60),
             },
             node: NodeConfig {
                 data_dir: dirs::home_dir()
@@ -202,6 +211,12 @@ fn apply_network_preset(config: &mut Config, network: &str) {
             config.network.rpc_endpoint = "https://rpc.omne.network".to_string();
             config.network.ws_endpoint = "wss://ws.omne.network".to_string();
             config.network.explorer_url = "https://explorer.omne.network".to_string();
+            config.network.allowed_services = vec![
+                "orchestrator".to_string(),
+                "analytics".to_string(),
+                "security".to_string(),
+            ];
+            config.network.rate_limit_per_minute = Some(120);
         }
         "devnet" => {
             config.network.name = "devnet".to_string();
@@ -209,6 +224,8 @@ fn apply_network_preset(config: &mut Config, network: &str) {
             config.network.rpc_endpoint = "http://localhost:8545".to_string();
             config.network.ws_endpoint = "ws://localhost:8546".to_string();
             config.network.explorer_url = "http://localhost:3000".to_string();
+            config.network.allowed_services = vec!["orchestrator".to_string()];
+            config.network.rate_limit_per_minute = None;
         }
         _ => {
             // Default testnet configuration is already set
