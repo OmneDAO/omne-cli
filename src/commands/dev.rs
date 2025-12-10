@@ -10,10 +10,9 @@ use axiom_runtime::{
     STANDARDVM_TIMEOUT_US,
 };
 use base64ct::{Base64, Encoding};
-use bincode;
 use chrono::Utc;
-use clap::{Subcommand, ValueEnum};
-use deploy_guardrails::enforce_allowed_services;
+use clap::{Args, Subcommand, ValueEnum};
+use deploy_guardrails::{enforce_allowed_services, PlanSignatureData, SignerAllowList};
 use dialoguer::Select;
 use ed25519_dalek::{Signer, SigningKey};
 use hex;
@@ -136,11 +135,107 @@ struct ExecutionPreviewSummary {
     deterministic_state: String,
 }
 
-#[derive(Debug, Serialize, Clone)]
-struct PlanSignature {
-    algorithm: String,
-    public_key_hex: String,
-    signature_hex: String,
+type PlanSignature = PlanSignatureData;
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum DeployOperation {
+    /// Generate and optionally submit a deployment plan
+    Plan,
+    /// Verify an existing deployment plan signature on disk
+    Verify,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DeployArgs {
+    /// Deployment workflow mode (defaults to plan generation)
+    #[arg(
+        value_enum,
+        value_name = "MODE",
+        default_value_t = DeployOperation::Plan,
+        num_args = 0..=1
+    )]
+    pub mode: DeployOperation,
+
+    #[command(flatten)]
+    pub plan: DeployPlanArgs,
+
+    #[command(flatten)]
+    pub verify: DeployVerifyArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DeployPlanArgs {
+    /// Contract WASM file path
+    #[arg(long)]
+    pub contract: Option<String>,
+
+    /// Contract entry selector (Contract::function)
+    #[arg(long)]
+    pub entry: Option<String>,
+
+    /// Output path for generated execution plan
+    #[arg(long)]
+    pub plan: Option<String>,
+
+    /// Enable infrastructure services
+    #[arg(long)]
+    pub services: Vec<String>,
+
+    /// Target network
+    #[arg(long, default_value = "testnet")]
+    pub network: String,
+
+    /// Authentication token for hardened deployment endpoint
+    #[arg(long)]
+    pub auth_token: Option<String>,
+
+    /// Allow services not present in the configured allow-list (unsafe)
+    #[arg(long)]
+    pub allow_unknown_services: bool,
+
+    /// Execution tier for generated config
+    #[arg(long, value_enum, default_value_t = DeployTier::Standard)]
+    pub tier: DeployTier,
+
+    /// Path to Ed25519 signing key (hex-encoded) for execution plan attestation
+    #[arg(long)]
+    pub signing_key: Option<String>,
+
+    /// Disable automatic plan signing (unsafe)
+    #[arg(long)]
+    pub no_sign: bool,
+}
+
+impl Default for DeployPlanArgs {
+    fn default() -> Self {
+        Self {
+            contract: None,
+            entry: None,
+            plan: None,
+            services: Vec::new(),
+            network: "testnet".to_string(),
+            auth_token: None,
+            allow_unknown_services: false,
+            tier: DeployTier::Standard,
+            signing_key: None,
+            no_sign: false,
+        }
+    }
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct DeployVerifyArgs {
+    /// Execution plan path to verify
+    #[arg(value_name = "PLAN", required_if_eq("mode", "verify"))]
+    pub plan: Option<String>,
+
+    /// Skip signer allow-list enforcement
+    #[arg(long)]
+    pub allow_unknown_signer: bool,
+
+    /// Additional signer public keys (hex) to permit during verification
+    #[arg(long = "allowed-signer", value_name = "HEX", action = clap::ArgAction::Append)]
+    pub allowed_signer: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -175,43 +270,7 @@ pub enum DevCommands {
     },
 
     /// Deploy contracts or services
-    Deploy {
-        /// Contract WASM file path
-        #[arg(long)]
-        contract: Option<String>,
-
-        /// Contract entry selector (Contract::function)
-        #[arg(long)]
-        entry: Option<String>,
-
-        /// Output path for generated execution plan
-        #[arg(long)]
-        plan: Option<String>,
-
-        /// Enable infrastructure services
-        #[arg(long)]
-        services: Vec<String>,
-
-        /// Target network
-        #[arg(long, default_value = "testnet")]
-        network: String,
-
-        /// Authentication token for hardened deployment endpoint
-        #[arg(long)]
-        auth_token: Option<String>,
-
-        /// Allow services not present in the configured allow-list (unsafe)
-        #[arg(long)]
-        allow_unknown_services: bool,
-
-        /// Execution tier for generated config
-        #[arg(long, value_enum, default_value = "standard")]
-        tier: DeployTier,
-
-        /// Path to Ed25519 signing key (hex-encoded) for execution plan attestation
-        #[arg(long)]
-        signing_key: Option<String>,
-    },
+    Deploy(DeployArgs),
 
     /// SDK management
     Sdk {
@@ -282,31 +341,12 @@ pub async fn execute(command: DevCommands, config: &Config) -> Result<()> {
             performance,
             component,
         } => run_tests(integration, performance, component.as_deref(), config).await,
-        DevCommands::Deploy {
-            contract,
-            entry,
-            plan,
-            services,
-            network,
-            auth_token,
-            allow_unknown_services,
-            tier,
-            signing_key,
-        } => {
-            deploy_project(
-                contract.as_deref(),
-                entry.as_deref(),
-                plan.as_deref(),
-                tier,
-                &services,
-                &network,
-                auth_token.as_deref(),
-                allow_unknown_services,
-                signing_key.as_deref(),
-                config,
-            )
-            .await
-        }
+        DevCommands::Deploy(args) => match args.mode {
+            DeployOperation::Plan => deploy_project(&args.plan, config).await,
+            DeployOperation::Verify => {
+                verify_execution_plan(&args.verify, &args.plan, config).await
+            }
+        },
         DevCommands::Sdk { action } => manage_sdk(action, config).await,
         DevCommands::Local { action } => manage_local_env(action, config).await,
     }
@@ -395,26 +435,17 @@ async fn run_tests(
     Ok(())
 }
 
-async fn deploy_project(
-    contract: Option<&str>,
-    entry: Option<&str>,
-    plan: Option<&str>,
-    tier: DeployTier,
-    services: &[String],
-    network: &str,
-    auth_token: Option<&str>,
-    allow_unknown_services: bool,
-    signing_key: Option<&str>,
-    config: &Config,
-) -> Result<()> {
-    info!("🚀 Deploying to Omne {} network", network);
+async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
+    info!("🚀 Deploying to Omne {} network", args.network);
 
-    if network == "mainnet" && !confirm("Deploy to MAINNET? This will use real funds.")? {
+    if args.network == "mainnet" && !confirm("Deploy to MAINNET? This will use real funds.")? {
         info!("Deployment cancelled");
         return Ok(());
     }
 
-    let effective_auth_token = auth_token
+    let effective_auth_token = args
+        .auth_token
+        .as_ref()
         .map(|token| token.to_string())
         .or_else(|| config.network.auth_token.clone())
         .or_else(|| {
@@ -424,12 +455,12 @@ async fn deploy_project(
         });
 
     let service_selection = enforce_allowed_services(
-        services,
+        &args.services,
         &config.network.allowed_services,
-        allow_unknown_services,
+        args.allow_unknown_services,
     )
     .map_err(|err| {
-        if allow_unknown_services {
+        if args.allow_unknown_services {
             anyhow!(err)
         } else {
             anyhow!("{} Pass --allow-unknown-services to override.", err)
@@ -437,7 +468,7 @@ async fn deploy_project(
     })?;
     let mut published_services = service_selection.clone();
 
-    if allow_unknown_services && !config.network.allowed_services.is_empty() {
+    if args.allow_unknown_services && !config.network.allowed_services.is_empty() {
         warn!("Bypassing service allow-list validation; proceed with caution.");
     } else if config.network.allowed_services.is_empty() && !service_selection.is_empty() {
         warn!(
@@ -450,7 +481,7 @@ async fn deploy_project(
         info!("🔐 Authentication token detected; including Authorization header");
     }
 
-    if let Some(contract_path) = contract {
+    if let Some(contract_path) = args.contract.as_deref() {
         info!("📦 Deploying contract: {}", contract_path);
         let analysis = spinner("Analyzing contract module...");
         let module = wasm::load_contract_module(contract_path).await?;
@@ -488,7 +519,7 @@ async fn deploy_project(
                 "contract module does not expose any ABI metadata; regenerate with the latest compiler"
             );
         }
-        let selected_method = if let Some(selector) = entry {
+        let selected_method = if let Some(selector) = args.entry.as_deref() {
             metadata
                 .resolve_method(selector)
                 .ok_or_else(|| anyhow!("no contract export named '{}' found", selector))?
@@ -532,22 +563,87 @@ async fn deploy_project(
                 info!("   Legacy export retained as {}", legacy);
             }
         }
-        info!("   Execution tier: {}", tier);
+        info!("   Execution tier: {}", args.tier);
 
-        let plan_path = plan
+        let plan_path = args
+            .plan
+            .as_ref()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(contract_path).with_extension("execution.json"));
 
         let mut execution_plan = build_execution_plan(
             &module,
             selected_method,
-            tier.clone(),
+            args.tier.clone(),
             &service_selection,
             config,
         )?;
 
-        if let Some(key_path) = signing_key {
-            sign_execution_plan(&mut execution_plan, key_path).await?;
+        let mut plan_signer: Option<[u8; 32]> = None;
+
+        if args.no_sign {
+            warn!("⚠️ Skipping plan signing; hardened endpoints will reject unsigned submissions.");
+        } else if let Some(key_path) = args.signing_key.as_deref() {
+            let verifying_key = sign_execution_plan(&mut execution_plan, key_path).await?;
+            let verifying_hex = hex::encode(verifying_key);
+            info!(
+                "🔏 Execution plan signed with supplied key {}",
+                verifying_hex
+            );
+            plan_signer = Some(verifying_key);
+        } else {
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let verifying_key = attach_plan_signature_with_key(&mut execution_plan, &signing_key)?;
+            let verifying_hex = hex::encode(verifying_key);
+            info!(
+                "🔏 Execution plan signed with ephemeral key {}",
+                verifying_hex
+            );
+
+            let mut key_path = plan_path.clone();
+            key_path.set_extension("signing-key");
+            fs::write(
+                &key_path,
+                format!("{}\n", hex::encode(signing_key.to_bytes())),
+            )
+            .await?;
+            info!(
+                "   Ephemeral signing key written to {} (delete after promotion)",
+                key_path.display()
+            );
+            plan_signer = Some(verifying_key);
+        }
+
+        if let Some(verifying_key) = plan_signer {
+            if !config.network.allowed_signers.is_empty() {
+                match SignerAllowList::from_hex_iter(
+                    config.network.allowed_signers.iter().map(|s| s.as_str()),
+                ) {
+                    Ok(list) => {
+                        if list.is_empty() {
+                            warn!(
+                                "No valid signer entries discovered in configuration allow-list; verification may fail."
+                            );
+                        } else if !list.contains_bytes(&verifying_key) {
+                            warn!(
+                                "Plan signer {} not present in configured allow-list; update configuration or rotate keys before mainnet promotion.",
+                                hex::encode(verifying_key)
+                            );
+                        } else {
+                            info!(
+                                "   Signer {} present in configured allow-list",
+                                hex::encode(verifying_key)
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            "Failed to parse signer allow-list from configuration: {}",
+                            err
+                        );
+                    }
+                }
+            }
         }
 
         if let Some(preview) = execution_plan.execution.preview.as_ref() {
@@ -634,13 +730,141 @@ async fn deploy_project(
     }
 
     info!("✅ Deployment complete!");
-    info!("   Network: {}", network);
+    info!("   Network: {}", args.network);
     let services_str = if published_services.is_empty() {
         "None".to_string()
     } else {
         published_services.join(", ")
     };
     info!("   Services: {}", services_str);
+
+    Ok(())
+}
+
+async fn verify_execution_plan(
+    verify: &DeployVerifyArgs,
+    defaults: &DeployPlanArgs,
+    config: &Config,
+) -> Result<()> {
+    let plan_path_str = verify
+        .plan
+        .as_deref()
+        .or_else(|| defaults.plan.as_deref())
+        .ok_or_else(|| anyhow!("plan path must be provided (pass <PLAN> or --plan)"))?;
+    let plan_path = PathBuf::from(plan_path_str);
+
+    info!(
+        "🔍 Verifying execution plan signature at {}",
+        plan_path.display()
+    );
+
+    let plan_bytes = fs::read(&plan_path)
+        .await
+        .with_context(|| format!("failed to read execution plan from {}", plan_path.display()))?;
+
+    let plan_value: JsonValue = serde_json::from_slice(&plan_bytes).with_context(|| {
+        format!(
+            "failed to parse execution plan JSON from {}",
+            plan_path.display()
+        )
+    })?;
+
+    let generated_at = plan_value
+        .get("generated_at")
+        .and_then(|value| value.as_str().map(|s| s.to_string()));
+
+    let network_value = match plan_value.get("network") {
+        Some(value) if !value.is_null() => Some(value.clone()),
+        _ => None,
+    };
+
+    let contract_value = plan_value
+        .get("contract")
+        .cloned()
+        .ok_or_else(|| anyhow!("execution plan missing 'contract' section"))?;
+
+    let execution_value = plan_value
+        .get("execution")
+        .cloned()
+        .ok_or_else(|| anyhow!("execution plan missing 'execution' section"))?;
+
+    let services = match plan_value.get("services") {
+        Some(JsonValue::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for value in items {
+                let service = value
+                    .as_str()
+                    .ok_or_else(|| anyhow!("services entries must be strings"))?;
+                out.push(service.to_string());
+            }
+            out
+        }
+        Some(JsonValue::Null) | None => Vec::new(),
+        Some(other) => {
+            bail!(
+                "execution plan 'services' must be an array of strings, found {}",
+                other
+            );
+        }
+    };
+
+    let signature_value = plan_value
+        .get("signature")
+        .cloned()
+        .ok_or_else(|| anyhow!("execution plan is missing 'signature' attestation"))?;
+    let signature: PlanSignature = serde_json::from_value(signature_value)
+        .context("failed to decode plan signature payload")?;
+
+    let mut allow_entries = config.network.allowed_signers.clone();
+    allow_entries.extend(verify.allowed_signer.iter().cloned());
+
+    let allow_list = if verify.allow_unknown_signer {
+        info!("   Allow-list enforcement disabled via --allow-unknown-signer");
+        None
+    } else {
+        match SignerAllowList::from_hex_iter(allow_entries.iter().map(|s| s.as_str())) {
+            Ok(list) if list.is_empty() => {
+                warn!(
+                    "No signer allow-list entries configured; verification will trust any valid signature."
+                );
+                None
+            }
+            Ok(list) => Some(list),
+            Err(err) => return Err(anyhow!(err.to_string())),
+        }
+    };
+
+    let digest = deploy_guardrails::canonical_plan_digest(
+        &generated_at,
+        &network_value,
+        &contract_value,
+        &execution_value,
+        &services,
+    )
+    .map_err(|err| anyhow!(err.to_string()))?;
+
+    let verifying_key = deploy_guardrails::verify_plan_signature(
+        &generated_at,
+        &network_value,
+        &contract_value,
+        &execution_value,
+        &services,
+        &signature,
+        allow_list.as_ref(),
+    )
+    .map_err(|err| anyhow!(err.to_string()))?;
+
+    let verifying_bytes = verifying_key.to_bytes();
+
+    info!("✅ Execution plan signature verified");
+    info!("   Digest: {}", hex::encode(digest));
+    info!("   Signer: {}", hex::encode(verifying_bytes));
+
+    if let Some(list) = allow_list {
+        if list.contains_bytes(&verifying_bytes) {
+            info!("   Signer present in configured allow-list");
+        }
+    }
 
     Ok(())
 }
@@ -945,7 +1169,7 @@ fn build_execution_plan(
     })
 }
 
-async fn sign_execution_plan(plan: &mut ExecutionPlan, key_path: &str) -> Result<()> {
+async fn sign_execution_plan(plan: &mut ExecutionPlan, key_path: &str) -> Result<[u8; 32]> {
     let raw = fs::read(key_path)
         .await
         .with_context(|| format!("failed to read signing key from {}", key_path))?;
@@ -968,6 +1192,13 @@ async fn sign_execution_plan(plan: &mut ExecutionPlan, key_path: &str) -> Result
         .map_err(|_| anyhow!("signing key must decode to exactly 32 bytes"))?;
 
     let signing_key = SigningKey::from_bytes(&secret_array);
+    attach_plan_signature_with_key(plan, &signing_key)
+}
+
+fn attach_plan_signature_with_key(
+    plan: &mut ExecutionPlan,
+    signing_key: &SigningKey,
+) -> Result<[u8; 32]> {
     let digest = compute_plan_digest(plan)?;
     let signature = signing_key.sign(&digest);
     let verifying_key = signing_key.verifying_key();
@@ -978,33 +1209,18 @@ async fn sign_execution_plan(plan: &mut ExecutionPlan, key_path: &str) -> Result
         signature_hex: hex::encode(signature.to_bytes()),
     });
 
-    Ok(())
+    Ok(verifying_key.to_bytes())
 }
 
 fn compute_plan_digest(plan: &ExecutionPlan) -> Result<[u8; 32]> {
-    #[derive(Serialize)]
-    struct SignatureMaterial<'a> {
-        generated_at: &'a Option<String>,
-        network: &'a Option<PlanNetwork>,
-        contract: &'a PlanContract,
-        execution: &'a PlanExecution,
-        services: &'a [String],
-    }
-
-    let material = SignatureMaterial {
-        generated_at: &plan.generated_at,
-        network: &plan.network,
-        contract: &plan.contract,
-        execution: &plan.execution,
-        services: &plan.services,
-    };
-
-    let serialized = bincode::serialize(&material)
-        .context("failed to canonicalise execution plan for signing")?;
-    let digest = Sha256::digest(&serialized);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    Ok(out)
+    deploy_guardrails::canonical_plan_digest(
+        &plan.generated_at,
+        &plan.network,
+        &plan.contract,
+        &plan.execution,
+        &plan.services,
+    )
+    .map_err(|err| anyhow!(err.to_string()))
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -1169,7 +1385,7 @@ mod tests {
         write!(key_file, "{}", hex::encode(signing_key.to_bytes())).expect("write key");
         let key_path = key_file.into_temp_path();
 
-        sign_execution_plan(&mut plan, key_path.to_str().unwrap())
+        let verifying_key = sign_execution_plan(&mut plan, key_path.to_str().unwrap())
             .await
             .expect("sign plan");
 
@@ -1177,6 +1393,50 @@ mod tests {
         assert_eq!(signature.algorithm, "ed25519");
         assert_eq!(signature.public_key_hex.len(), 64);
         assert_eq!(signature.signature_hex.len(), 128);
+        assert_eq!(hex::encode(verifying_key).len(), 64);
+    }
+
+    #[tokio::test]
+    async fn verify_execution_plan_accepts_signed_plan() {
+        let module = load_demo_module().await;
+        let metadata = module.metadata();
+        let method = metadata
+            .resolve_method("Demo::init")
+            .expect("method present");
+
+        let mut plan = build_execution_plan(
+            &module,
+            method,
+            DeployTier::Standard,
+            &[],
+            &Config::default(),
+        )
+        .expect("plan build");
+
+        let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+        let verifying_key =
+            attach_plan_signature_with_key(&mut plan, &signing_key).expect("sign plan");
+
+        let plan_bytes = serde_json::to_vec_pretty(&plan).expect("serialize plan");
+        let mut plan_file = NamedTempFile::new().expect("plan file");
+        plan_file.write_all(&plan_bytes).expect("write plan");
+        let plan_path = plan_file.into_temp_path();
+
+        let mut config = Config::default();
+        config.network.allowed_signers = vec![hex::encode(verifying_key)];
+
+        let mut defaults = DeployPlanArgs::default();
+        defaults.plan = Some(plan_path.to_string_lossy().into_owned());
+
+        let verify_args = DeployVerifyArgs {
+            plan: Some(defaults.plan.clone().expect("plan")),
+            allow_unknown_signer: false,
+            allowed_signer: Vec::new(),
+        };
+
+        verify_execution_plan(&verify_args, &defaults, &config)
+            .await
+            .expect("verification succeeds");
     }
 
     #[tokio::test]
