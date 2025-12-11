@@ -1,7 +1,7 @@
 //! Helpers for inspecting compiled WASM contracts and extracting Omne ABI metadata.
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -76,7 +76,7 @@ impl ContractMetadata {
 }
 
 /// Description of a single contract export discovered within the module.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContractMethod {
     pub contract: String,
     pub function: String,

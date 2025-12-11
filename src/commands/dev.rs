@@ -66,7 +66,7 @@ impl fmt::Display for DeployTier {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ExecutionPlan {
     #[serde(skip_serializing_if = "Option::is_none")]
     generated_at: Option<String>,
@@ -79,7 +79,7 @@ struct ExecutionPlan {
     signature: Option<PlanSignature>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct PlanNetwork {
     name: String,
     chain_id: u64,
@@ -88,7 +88,7 @@ struct PlanNetwork {
     explorer_url: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct PlanContract {
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
@@ -101,14 +101,69 @@ struct PlanContract {
     metadata: Option<PlanContractMetadata>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct PlanContractMetadata {
     has_axiom_entry_main: bool,
     has_legacy_entry_main: bool,
     methods: Vec<wasm::ContractMethod>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compiler: Option<CompilerAttachment>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct CompilerAttachment {
+    metadata_version: String,
+    compiler_version: String,
+    generated_at: String,
+    wasm_sha256: String,
+    wasm_size_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_functions: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<CompilerMetadataSignature>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct CompilerMetadataSignature {
+    algorithm: String,
+    public_key_hex: String,
+    signature_hex: String,
+    digest_hex: String,
+    signed_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompilerMetadataEnvelope {
+    metadata: CompilerMetadataPayload,
+    #[serde(default)]
+    signature: Option<CompilerMetadataSignaturePayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompilerMetadataPayload {
+    metadata_version: String,
+    compiler_version: String,
+    generated_at: String,
+    wasm_sha256: String,
+    wasm_size_bytes: usize,
+    #[serde(default)]
+    host_functions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompilerMetadataSignaturePayload {
+    algorithm: String,
+    #[serde(rename = "public_key_hex")]
+    public_key_hex: String,
+    #[serde(rename = "signature_hex")]
+    signature_hex: String,
+    #[serde(rename = "digest_hex")]
+    digest_hex: String,
+    #[serde(rename = "signed_at")]
+    signed_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct PlanEntry {
     contract: String,
     function: String,
@@ -117,7 +172,7 @@ struct PlanEntry {
     legacy_export: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct PlanExecution {
     tier: String,
     config: RuntimeExecutionConfig,
@@ -127,7 +182,7 @@ struct PlanExecution {
     preview_summary: Option<ExecutionPreviewSummary>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ExecutionPreviewSummary {
     execution_time_ms: u128,
     gas_consumed: u64,
@@ -571,12 +626,41 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(contract_path).with_extension("execution.json"));
 
+        let compiler_attachment = match load_compiler_attachment(contract_path).await {
+            Ok(Some(attachment)) => {
+                info!(
+                    "   Compiler metadata version {} (compiler {})",
+                    attachment.metadata_version,
+                    attachment.compiler_version
+                );
+                if let Some(hosts) = attachment.host_functions.as_ref() {
+                    info!("   Host functions referenced: {}", hosts.join(", "));
+                }
+                Some(attachment)
+            }
+            Ok(None) => {
+                info!(
+                    "   No compiler metadata envelope found alongside contract {}; continuing",
+                    contract_path
+                );
+                None
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to load compiler metadata for {}: {}",
+                    contract_path, err
+                );
+                None
+            }
+        };
+
         let mut execution_plan = build_execution_plan(
             &module,
             selected_method,
             args.tier.clone(),
             &service_selection,
             config,
+            compiler_attachment.clone(),
         )?;
 
         let mut plan_signer: Option<[u8; 32]> = None;
@@ -762,58 +846,18 @@ async fn verify_execution_plan(
         .await
         .with_context(|| format!("failed to read execution plan from {}", plan_path.display()))?;
 
-    let plan_value: JsonValue = serde_json::from_slice(&plan_bytes).with_context(|| {
+    let plan: ExecutionPlan = serde_json::from_slice(&plan_bytes).with_context(|| {
         format!(
             "failed to parse execution plan JSON from {}",
             plan_path.display()
         )
     })?;
 
-    let generated_at = plan_value
-        .get("generated_at")
-        .and_then(|value| value.as_str().map(|s| s.to_string()));
-
-    let network_value = match plan_value.get("network") {
-        Some(value) if !value.is_null() => Some(value.clone()),
-        _ => None,
-    };
-
-    let contract_value = plan_value
-        .get("contract")
-        .cloned()
-        .ok_or_else(|| anyhow!("execution plan missing 'contract' section"))?;
-
-    let execution_value = plan_value
-        .get("execution")
-        .cloned()
-        .ok_or_else(|| anyhow!("execution plan missing 'execution' section"))?;
-
-    let services = match plan_value.get("services") {
-        Some(JsonValue::Array(items)) => {
-            let mut out = Vec::with_capacity(items.len());
-            for value in items {
-                let service = value
-                    .as_str()
-                    .ok_or_else(|| anyhow!("services entries must be strings"))?;
-                out.push(service.to_string());
-            }
-            out
-        }
-        Some(JsonValue::Null) | None => Vec::new(),
-        Some(other) => {
-            bail!(
-                "execution plan 'services' must be an array of strings, found {}",
-                other
-            );
-        }
-    };
-
-    let signature_value = plan_value
-        .get("signature")
+    let signature = plan
+        .signature
+        .as_ref()
         .cloned()
         .ok_or_else(|| anyhow!("execution plan is missing 'signature' attestation"))?;
-    let signature: PlanSignature = serde_json::from_value(signature_value)
-        .context("failed to decode plan signature payload")?;
 
     let mut allow_entries = config.network.allowed_signers.clone();
     allow_entries.extend(verify.allowed_signer.iter().cloned());
@@ -835,20 +879,20 @@ async fn verify_execution_plan(
     };
 
     let digest = deploy_guardrails::canonical_plan_digest(
-        &generated_at,
-        &network_value,
-        &contract_value,
-        &execution_value,
-        &services,
+        &plan.generated_at,
+        &plan.network,
+        &plan.contract,
+        &plan.execution,
+        &plan.services,
     )
     .map_err(|err| anyhow!(err.to_string()))?;
 
     let verifying_key = deploy_guardrails::verify_plan_signature(
-        &generated_at,
-        &network_value,
-        &contract_value,
-        &execution_value,
-        &services,
+        &plan.generated_at,
+        &plan.network,
+        &plan.contract,
+        &plan.execution,
+        &plan.services,
         &signature,
         allow_list.as_ref(),
     )
@@ -966,6 +1010,55 @@ async fn manage_local_env(action: LocalCommands, _config: &Config) -> Result<()>
         }
     }
     Ok(())
+}
+
+async fn load_compiler_attachment(contract_path: &str) -> Result<Option<CompilerAttachment>> {
+    let path = Path::new(contract_path);
+    let metadata_path = path.with_extension("metadata.json");
+
+    match fs::metadata(&metadata_path).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to inspect compiler metadata at {}", metadata_path.display()));
+        }
+    }
+
+    let bytes = fs::read(&metadata_path)
+        .await
+        .with_context(|| format!("failed to read compiler metadata from {}", metadata_path.display()))?;
+
+    let envelope: CompilerMetadataEnvelope = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse compiler metadata JSON from {}", metadata_path.display()))?;
+
+    let host_functions = if envelope.metadata.host_functions.is_empty() {
+        None
+    } else {
+        Some(envelope.metadata.host_functions.clone())
+    };
+
+    let signature = envelope.signature.map(|sig| CompilerMetadataSignature {
+        algorithm: sig.algorithm,
+        public_key_hex: sig.public_key_hex,
+        signature_hex: sig.signature_hex,
+        digest_hex: sig.digest_hex,
+        signed_at: sig.signed_at,
+    });
+
+    let attachment = CompilerAttachment {
+        metadata_version: envelope.metadata.metadata_version,
+        compiler_version: envelope.metadata.compiler_version,
+        generated_at: envelope.metadata.generated_at,
+        wasm_sha256: envelope.metadata.wasm_sha256,
+        wasm_size_bytes: envelope.metadata.wasm_size_bytes,
+        host_functions,
+        signature,
+    };
+
+    Ok(Some(attachment))
 }
 
 fn create_engine(tier: &DeployTier) -> Result<AxiomEngine> {
@@ -1107,6 +1200,7 @@ fn build_execution_plan(
     tier: DeployTier,
     services: &[String],
     config: &Config,
+    compiler_attachment: Option<CompilerAttachment>,
 ) -> Result<ExecutionPlan> {
     let exec_config = tier.build_execution_config(&method.contract, &method.function);
     let engine = create_engine(&tier)?;
@@ -1156,6 +1250,7 @@ fn build_execution_plan(
                 has_axiom_entry_main: metadata.has_runtime_entry(),
                 has_legacy_entry_main: metadata.has_legacy_entry(),
                 methods: metadata.contract_methods().to_vec(),
+                compiler: compiler_attachment,
             }),
         },
         execution: PlanExecution {
@@ -1339,6 +1434,7 @@ mod tests {
             DeployTier::Standard,
             &[],
             &Config::default(),
+            None,
         )
         .expect("plan build");
 
@@ -1377,6 +1473,7 @@ mod tests {
             DeployTier::Standard,
             &[],
             &Config::default(),
+            None,
         )
         .expect("plan build");
 
@@ -1410,6 +1507,7 @@ mod tests {
             DeployTier::Standard,
             &[],
             &Config::default(),
+            None,
         )
         .expect("plan build");
 
@@ -1466,7 +1564,7 @@ mod tests {
         config.network.ws_endpoint = "ws://test".to_string();
         config.network.explorer_url = "http://test".to_string();
 
-        let plan = build_execution_plan(&module, method, DeployTier::Standard, &[], &config)
+        let plan = build_execution_plan(&module, method, DeployTier::Standard, &[], &config, None)
             .expect("plan build");
 
         let response = submit_execution_plan(&plan, &config, None)
