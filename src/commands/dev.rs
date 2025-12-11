@@ -6,7 +6,9 @@ use crate::wasm;
 use anyhow::{anyhow, bail, Context, Result};
 use axiom_runtime::{
     AxiomEngine, ExecutionConfig as RuntimeExecutionConfig, ExecutionResult, COMPUTEVM_GAS_LIMIT,
-    COMPUTEVM_TIMEOUT_US, FASTVM_GAS_LIMIT, FASTVM_TIMEOUT_US, STANDARDVM_GAS_LIMIT,
+    COMPUTEVM_MAX_CALL_DEPTH, COMPUTEVM_STORAGE_BUDGET_BYTES, COMPUTEVM_TIMEOUT_US,
+    FASTVM_GAS_LIMIT, FASTVM_MAX_CALL_DEPTH, FASTVM_STORAGE_BUDGET_BYTES, FASTVM_TIMEOUT_US,
+    STANDARDVM_GAS_LIMIT, STANDARDVM_MAX_CALL_DEPTH, STANDARDVM_STORAGE_BUDGET_BYTES,
     STANDARDVM_TIMEOUT_US,
 };
 use base64ct::{Base64, Encoding};
@@ -15,6 +17,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use deploy_guardrails::{
     compiler_signers_vec_for_network,
     enforce_allowed_services,
+    validate_execution_guardrails,
     verify_metadata_signature,
     CompilerMetadata,
     CompilerMetadataSignature,
@@ -57,13 +60,19 @@ impl DeployTier {
         match self {
             DeployTier::Fastvm => RuntimeExecutionConfig::contract_entry(contract, function)
                 .with_gas_limit(FASTVM_GAS_LIMIT)
-                .with_timeout(Duration::from_micros(FASTVM_TIMEOUT_US)),
+                .with_timeout(Duration::from_micros(FASTVM_TIMEOUT_US))
+                .with_max_call_depth(FASTVM_MAX_CALL_DEPTH)
+                .with_storage_budget_bytes(FASTVM_STORAGE_BUDGET_BYTES),
             DeployTier::Standard => RuntimeExecutionConfig::contract_entry(contract, function)
                 .with_gas_limit(STANDARDVM_GAS_LIMIT)
-                .with_timeout(Duration::from_micros(STANDARDVM_TIMEOUT_US)),
+                .with_timeout(Duration::from_micros(STANDARDVM_TIMEOUT_US))
+                .with_max_call_depth(STANDARDVM_MAX_CALL_DEPTH)
+                .with_storage_budget_bytes(STANDARDVM_STORAGE_BUDGET_BYTES),
             DeployTier::Compute => RuntimeExecutionConfig::contract_entry(contract, function)
                 .with_gas_limit(COMPUTEVM_GAS_LIMIT)
-                .with_timeout(Duration::from_micros(COMPUTEVM_TIMEOUT_US)),
+                .with_timeout(Duration::from_micros(COMPUTEVM_TIMEOUT_US))
+                .with_max_call_depth(COMPUTEVM_MAX_CALL_DEPTH)
+                .with_storage_budget_bytes(COMPUTEVM_STORAGE_BUDGET_BYTES),
         }
     }
 }
@@ -159,6 +168,8 @@ struct ExecutionPreviewSummary {
     gas_consumed: u64,
     return_value: Option<axiom_runtime::execution::SerializableVal>,
     deterministic_state: String,
+    call_depth_used: u32,
+    storage_bytes_written: u64,
 }
 
 type PlanSignature = PlanSignatureData;
@@ -710,6 +721,14 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
                 "   Preview execution time: {} ms",
                 summary.execution_time_ms
             );
+            info!(
+                "   Preview call depth observed: {}",
+                summary.call_depth_used
+            );
+            info!(
+                "   Preview storage writes: {} bytes",
+                summary.storage_bytes_written
+            );
         }
 
         let plan_bytes = serde_json::to_vec_pretty(&execution_plan)?;
@@ -1167,6 +1186,12 @@ fn build_execution_plan(
     compiler_attachment: Option<CompilerAttachment>,
 ) -> Result<ExecutionPlan> {
     let exec_config = tier.build_execution_config(&method.contract, &method.function);
+    validate_execution_guardrails(
+        tier.as_str(),
+        exec_config.max_call_depth,
+        exec_config.storage_budget_bytes,
+    )
+    .map_err(|err| anyhow!(err.to_string()))?;
     let engine = create_engine(&tier)?;
     let execution_preview = engine
         .execute(module.bytes(), exec_config.clone())
@@ -1177,6 +1202,8 @@ fn build_execution_plan(
         gas_consumed: execution_preview.gas_consumed,
         return_value: execution_preview.return_value.clone(),
         deterministic_state: execution_preview.deterministic_state.clone(),
+        call_depth_used: execution_preview.call_depth_used,
+        storage_bytes_written: execution_preview.storage_bytes_written,
     };
 
     let metadata = module.metadata();
@@ -1524,6 +1551,15 @@ mod tests {
             Some(compiler_attachment),
         )
         .expect("plan build");
+
+        assert_eq!(
+            plan.execution.config.max_call_depth,
+            STANDARDVM_MAX_CALL_DEPTH
+        );
+        assert_eq!(
+            plan.execution.config.storage_budget_bytes,
+            STANDARDVM_STORAGE_BUDGET_BYTES
+        );
 
         let preview = plan.execution.preview.expect("preview present");
         assert_eq!(preview.return_value, Some(SerializableVal::I64(7)));
