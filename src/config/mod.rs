@@ -1,7 +1,7 @@
 //! Configuration management for Omne CLI
 
 use anyhow::{Context, Result};
-use deploy_guardrails::signers_vec_for_network;
+use deploy_guardrails::{compiler_signers_vec_for_network, signers_vec_for_network};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -32,6 +32,8 @@ pub struct NetworkConfig {
     pub allowed_services: Vec<String>,
     #[serde(default)]
     pub allowed_signers: Vec<String>,
+    #[serde(default)]
+    pub allowed_compiler_signers: Vec<String>,
     #[serde(default)]
     pub auth_token: Option<String>,
     #[serde(default)]
@@ -108,6 +110,7 @@ impl Default for Config {
                 explorer_url: "https://testnet-explorer.omne.network".to_string(),
                 allowed_services: vec!["orchestrator".to_string(), "analytics".to_string()],
                 allowed_signers: signers_vec_for_network("testnet"),
+                allowed_compiler_signers: compiler_signers_vec_for_network("testnet"),
                 auth_token: None,
                 rate_limit_per_minute: Some(60),
             },
@@ -221,6 +224,7 @@ fn apply_network_preset(config: &mut Config, network: &str) {
                 "security".to_string(),
             ];
             config.network.allowed_signers = signers_vec_for_network("mainnet");
+            config.network.allowed_compiler_signers = compiler_signers_vec_for_network("mainnet");
             config.network.rate_limit_per_minute = Some(120);
         }
         "devnet" => {
@@ -231,6 +235,7 @@ fn apply_network_preset(config: &mut Config, network: &str) {
             config.network.explorer_url = "http://localhost:3000".to_string();
             config.network.allowed_services = vec!["orchestrator".to_string()];
             config.network.allowed_signers = signers_vec_for_network("devnet");
+            config.network.allowed_compiler_signers = compiler_signers_vec_for_network("devnet");
             config.network.rate_limit_per_minute = None;
         }
         _ => {

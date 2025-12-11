@@ -12,7 +12,15 @@ use axiom_runtime::{
 use base64ct::{Base64, Encoding};
 use chrono::Utc;
 use clap::{Args, Subcommand, ValueEnum};
-use deploy_guardrails::{enforce_allowed_services, PlanSignatureData, SignerAllowList};
+use deploy_guardrails::{
+    compiler_signers_vec_for_network,
+    enforce_allowed_services,
+    verify_metadata_signature,
+    CompilerMetadata,
+    CompilerMetadataSignature,
+    PlanSignatureData,
+    SignerAllowList,
+};
 use dialoguer::Select;
 use ed25519_dalek::{Signer, SigningKey};
 use hex;
@@ -66,7 +74,7 @@ impl fmt::Display for DeployTier {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExecutionPlan {
     #[serde(skip_serializing_if = "Option::is_none")]
     generated_at: Option<String>,
@@ -79,7 +87,7 @@ struct ExecutionPlan {
     signature: Option<PlanSignature>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanNetwork {
     name: String,
     chain_id: u64,
@@ -88,7 +96,7 @@ struct PlanNetwork {
     explorer_url: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanContract {
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
@@ -101,7 +109,7 @@ struct PlanContract {
     metadata: Option<PlanContractMetadata>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanContractMetadata {
     has_axiom_entry_main: bool,
     has_legacy_entry_main: bool,
@@ -112,67 +120,30 @@ struct PlanContractMetadata {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct CompilerAttachment {
-    metadata_version: String,
-    compiler_version: String,
-    generated_at: String,
-    wasm_sha256: String,
-    wasm_size_bytes: usize,
+    metadata: CompilerMetadata,
     #[serde(skip_serializing_if = "Option::is_none")]
-    host_functions: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     signature: Option<CompilerMetadataSignature>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct CompilerMetadataSignature {
-    algorithm: String,
-    public_key_hex: String,
-    signature_hex: String,
-    digest_hex: String,
-    signed_at: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct CompilerMetadataEnvelope {
-    metadata: CompilerMetadataPayload,
+    metadata: CompilerMetadata,
     #[serde(default)]
-    signature: Option<CompilerMetadataSignaturePayload>,
+    signature: Option<CompilerMetadataSignature>,
 }
 
-#[derive(Debug, Deserialize)]
-struct CompilerMetadataPayload {
-    metadata_version: String,
-    compiler_version: String,
-    generated_at: String,
-    wasm_sha256: String,
-    wasm_size_bytes: usize,
-    #[serde(default)]
-    host_functions: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CompilerMetadataSignaturePayload {
-    algorithm: String,
-    #[serde(rename = "public_key_hex")]
-    public_key_hex: String,
-    #[serde(rename = "signature_hex")]
-    signature_hex: String,
-    #[serde(rename = "digest_hex")]
-    digest_hex: String,
-    #[serde(rename = "signed_at")]
-    signed_at: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanEntry {
     contract: String,
     function: String,
     selector: String,
     export: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     legacy_export: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanExecution {
     tier: String,
     config: RuntimeExecutionConfig,
@@ -182,7 +153,7 @@ struct PlanExecution {
     preview_summary: Option<ExecutionPreviewSummary>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExecutionPreviewSummary {
     execution_time_ms: u128,
     gas_consumed: u64,
@@ -626,31 +597,32 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(contract_path).with_extension("execution.json"));
 
-        let compiler_attachment = match load_compiler_attachment(contract_path).await {
+        let compiler_attachment = match load_compiler_attachment(&module).await {
             Ok(Some(attachment)) => {
                 info!(
                     "   Compiler metadata version {} (compiler {})",
-                    attachment.metadata_version,
-                    attachment.compiler_version
+                    attachment.metadata.metadata_version,
+                    attachment.metadata.compiler_version
                 );
-                if let Some(hosts) = attachment.host_functions.as_ref() {
-                    info!("   Host functions referenced: {}", hosts.join(", "));
+                if !attachment.metadata.host_functions.is_empty() {
+                    info!(
+                        "   Host functions referenced: {}",
+                        attachment.metadata.host_functions.join(", ")
+                    );
                 }
                 Some(attachment)
             }
             Ok(None) => {
-                info!(
-                    "   No compiler metadata envelope found alongside contract {}; continuing",
+                bail!(
+                    "compiler metadata envelope not found alongside contract {}. Re-run the compiler with metadata signing enabled",
                     contract_path
                 );
-                None
             }
             Err(err) => {
-                warn!(
-                    "Failed to load compiler metadata for {}: {}",
+                bail!(
+                    "failed to load compiler metadata for {}: {}",
                     contract_path, err
                 );
-                None
             }
         };
 
@@ -1012,9 +984,8 @@ async fn manage_local_env(action: LocalCommands, _config: &Config) -> Result<()>
     Ok(())
 }
 
-async fn load_compiler_attachment(contract_path: &str) -> Result<Option<CompilerAttachment>> {
-    let path = Path::new(contract_path);
-    let metadata_path = path.with_extension("metadata.json");
+async fn load_compiler_attachment(module: &wasm::ContractModule) -> Result<Option<CompilerAttachment>> {
+    let metadata_path = module.path().with_extension("metadata.json");
 
     match fs::metadata(&metadata_path).await {
         Ok(_) => {}
@@ -1034,31 +1005,10 @@ async fn load_compiler_attachment(contract_path: &str) -> Result<Option<Compiler
     let envelope: CompilerMetadataEnvelope = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse compiler metadata JSON from {}", metadata_path.display()))?;
 
-    let host_functions = if envelope.metadata.host_functions.is_empty() {
-        None
-    } else {
-        Some(envelope.metadata.host_functions.clone())
-    };
-
-    let signature = envelope.signature.map(|sig| CompilerMetadataSignature {
-        algorithm: sig.algorithm,
-        public_key_hex: sig.public_key_hex,
-        signature_hex: sig.signature_hex,
-        digest_hex: sig.digest_hex,
-        signed_at: sig.signed_at,
-    });
-
-    let attachment = CompilerAttachment {
-        metadata_version: envelope.metadata.metadata_version,
-        compiler_version: envelope.metadata.compiler_version,
-        generated_at: envelope.metadata.generated_at,
-        wasm_sha256: envelope.metadata.wasm_sha256,
-        wasm_size_bytes: envelope.metadata.wasm_size_bytes,
-        host_functions,
-        signature,
-    };
-
-    Ok(Some(attachment))
+    Ok(Some(CompilerAttachment {
+        metadata: envelope.metadata,
+        signature: envelope.signature,
+    }))
 }
 
 fn create_engine(tier: &DeployTier) -> Result<AxiomEngine> {
@@ -1094,6 +1044,8 @@ async fn submit_execution_plan(
     let client = Client::new();
     let mut request = client.post(endpoint).json(&payload);
 
+    request = request.header("X-Omne-Nonce", plan.contract.deployment_nonce.as_str());
+
     if let Some(token) = auth_token.map(|t| t.trim()).filter(|t| !t.is_empty()) {
         if token.to_ascii_lowercase().starts_with("bearer ") || token.contains(' ') {
             request = request.header(AUTHORIZATION, token);
@@ -1108,6 +1060,7 @@ async fn submit_execution_plan(
         .with_context(|| format!("failed to submit execution plan to {}", endpoint))?;
 
     let status = response.status();
+    let response_headers = response.headers().clone();
     let envelope: JsonRpcEnvelope = response
         .json()
         .await
@@ -1121,15 +1074,26 @@ async fn submit_execution_plan(
             .unwrap_or_default();
 
         if status == StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = response_headers
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
             if let Some(limit) = config.network.rate_limit_per_minute {
                 bail!(
                     "deployment rejected: rate limit exceeded (limit: {} requests/min). Retry later or request a higher limit.",
                     limit
                 );
             } else {
-                bail!(
-                    "deployment rejected: rate limit exceeded (HTTP 429). Retry later or request a higher limit."
-                );
+                if let Some(seconds) = retry_after {
+                    bail!(
+                        "deployment rejected: rate limit exceeded (HTTP 429). Retry after {}s or request a higher limit.",
+                        seconds
+                    );
+                } else {
+                    bail!(
+                        "deployment rejected: rate limit exceeded (HTTP 429). Retry later or request a higher limit."
+                    );
+                }
             }
         } else if status == StatusCode::FORBIDDEN {
             if data.is_empty() {
@@ -1223,6 +1187,55 @@ fn build_execution_plan(
     let mut nonce_bytes = [0u8; 16];
     OsRng.fill_bytes(&mut nonce_bytes);
     let deployment_nonce = hex::encode(nonce_bytes);
+
+    let compiler_attachment = match compiler_attachment {
+        Some(attachment) => {
+            if attachment.metadata.wasm_sha256 != wasm_sha256 {
+                bail!(
+                    "compiler metadata wasm hash {} does not match module hash {}",
+                    attachment.metadata.wasm_sha256,
+                    wasm_sha256
+                );
+            }
+
+            if attachment.metadata.wasm_size_bytes != module.bytes().len() {
+                bail!(
+                    "compiler metadata size {} does not match module size {}",
+                    attachment.metadata.wasm_size_bytes,
+                    module.bytes().len()
+                );
+            }
+
+            let signature = attachment.signature.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "compiler metadata for {} is unsigned; re-run compiler with signing enabled",
+                    module
+                        .path()
+                        .display()
+                )
+            })?;
+
+            let allow_entries = if config.network.allowed_compiler_signers.is_empty() {
+                compiler_signers_vec_for_network(&config.network.name)
+            } else {
+                config.network.allowed_compiler_signers.clone()
+            };
+
+            let allow_list = SignerAllowList::from_hex_iter(allow_entries.iter().map(|s| s.as_str()))
+                .map_err(|err| anyhow!(err.to_string()))?;
+
+            let verifying_key = verify_metadata_signature(&attachment.metadata, signature, Some(&allow_list))
+                .map_err(|err| anyhow!(err.to_string()))?;
+
+            info!(
+                "   Compiler metadata signature verified (signer {})",
+                hex::encode(verifying_key.to_bytes())
+            );
+
+            Some(attachment)
+        }
+        None => None,
+    };
 
     Ok(ExecutionPlan {
         generated_at: Some(Utc::now().to_rfc3339()),
@@ -1410,6 +1423,76 @@ mod tests {
             i64.const 7)
     )"#;
 
+    fn make_signed_compiler_attachment(
+        module: &wasm::ContractModule,
+    ) -> (CompilerAttachment, String) {
+        use deploy_guardrails::metadata::{
+            CompilerContractMetadata as GuardrailContractMetadata,
+            CompilerContractMethodMetadata as GuardrailMethodMetadata,
+        };
+        use std::collections::BTreeMap;
+
+        let wasm_sha256 = format!("{:x}", Sha256::digest(module.bytes()));
+        let mut contracts: BTreeMap<String, Vec<GuardrailMethodMetadata>> = BTreeMap::new();
+
+        for method in module.metadata().contract_methods() {
+            contracts
+                .entry(method.contract.clone())
+                .or_default()
+                .push(GuardrailMethodMetadata {
+                    name: method.function.clone(),
+                    selector: method.selector(),
+                    export: method.export.clone(),
+                    params: Vec::new(),
+                    return_type: None,
+                });
+        }
+
+        let compiler_contracts = contracts
+            .into_iter()
+            .map(|(name, methods)| GuardrailContractMetadata {
+                name,
+                params: Vec::new(),
+                storage: Vec::new(),
+                methods,
+            })
+            .collect();
+
+        let metadata = CompilerMetadata {
+            metadata_version: "1.0".to_string(),
+            compiler_version: "test-suite".to_string(),
+            generated_at: "2024-01-01T00:00:00Z".to_string(),
+            source_path: module
+                .path()
+                .to_str()
+                .map(|value| value.to_string()),
+            wasm_sha256: wasm_sha256.clone(),
+            wasm_size_bytes: module.bytes().len(),
+            contracts: compiler_contracts,
+            free_functions: Vec::new(),
+            host_functions: Vec::new(),
+        };
+
+        let signing_key = SigningKey::from_bytes(&[5u8; 32]);
+        let digest = deploy_guardrails::canonical_metadata_digest(&metadata).expect("digest");
+        let signature = signing_key.sign(digest.as_ref());
+        let verifying_key = signing_key.verifying_key();
+        let verifying_hex = hex::encode(verifying_key.to_bytes());
+
+        let attachment = CompilerAttachment {
+            metadata,
+            signature: Some(CompilerMetadataSignature {
+                algorithm: "ed25519".to_string(),
+                public_key_hex: verifying_hex.clone(),
+                signature_hex: hex::encode(signature.to_bytes()),
+                digest_hex: hex::encode(digest),
+                signed_at: "2024-01-01T00:00:00Z".to_string(),
+            }),
+        };
+
+        (attachment, verifying_hex)
+    }
+
     async fn load_demo_module() -> wasm::ContractModule {
         let mut file = NamedTempFile::new().expect("temp file");
         let bytes = parse_str(DEMO_WAT).expect("valid wat");
@@ -1428,13 +1511,17 @@ mod tests {
             .resolve_method("Demo::init")
             .expect("method present");
 
+        let (compiler_attachment, compiler_signer) = make_signed_compiler_attachment(&module);
+        let mut config = Config::default();
+        config.network.allowed_compiler_signers = vec![compiler_signer];
+
         let plan = build_execution_plan(
             &module,
             method,
             DeployTier::Standard,
             &[],
-            &Config::default(),
-            None,
+            &config,
+            Some(compiler_attachment),
         )
         .expect("plan build");
 
@@ -1467,13 +1554,17 @@ mod tests {
             .resolve_method("Demo::init")
             .expect("method present");
 
+        let (compiler_attachment, compiler_signer) = make_signed_compiler_attachment(&module);
+        let mut config = Config::default();
+        config.network.allowed_compiler_signers = vec![compiler_signer];
+
         let mut plan = build_execution_plan(
             &module,
             method,
             DeployTier::Standard,
             &[],
-            &Config::default(),
-            None,
+            &config,
+            Some(compiler_attachment),
         )
         .expect("plan build");
 
@@ -1501,13 +1592,17 @@ mod tests {
             .resolve_method("Demo::init")
             .expect("method present");
 
+        let (compiler_attachment, compiler_signer) = make_signed_compiler_attachment(&module);
+        let mut plan_config = Config::default();
+        plan_config.network.allowed_compiler_signers = vec![compiler_signer.clone()];
+
         let mut plan = build_execution_plan(
             &module,
             method,
             DeployTier::Standard,
             &[],
-            &Config::default(),
-            None,
+            &plan_config,
+            Some(compiler_attachment),
         )
         .expect("plan build");
 
@@ -1522,6 +1617,7 @@ mod tests {
 
         let mut config = Config::default();
         config.network.allowed_signers = vec![hex::encode(verifying_key)];
+        config.network.allowed_compiler_signers = vec![compiler_signer];
 
         let mut defaults = DeployPlanArgs::default();
         defaults.plan = Some(plan_path.to_string_lossy().into_owned());

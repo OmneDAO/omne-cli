@@ -151,6 +151,11 @@ omne dev deploy --no-sign --contract ./contract.wasm --network devnet
 - `omne dev deploy verify <plan.json>` replays the canonical digest computation and checks the signature against the configured signer allow-list. Add extra approved keys inline with `--allowed-signer <hex>` or bypass enforcement with `--allow-unknown-signer` (not recommended for production).
 - `--no-sign` skips attaching a signature entirely—handy for local smoke tests, but hardened RPC endpoints will reject unsigned plans.
 
+##### SDK Alignment
+
+- The TypeScript SDK exposes the same hardened submission flow via `omneClient.deployExecutionPlan(plan, options)` and low-level helpers such as `generateDeploymentNonce`, `buildDeploymentHeaders`, and `ensureSignedCompilerAttachment`. This allows backend services or CI pipelines to reuse the CLI’s guardrail logic when calling the `/v1/deployments` API directly.
+- See `sdk/typescript/examples/basic-usage.ts` for an end-to-end sample that loads a signed plan, verifies compiler metadata, and submits using the new helper. Keeping the CLI and SDK aligned ensures signatures, nonce handling, and error messaging stay consistent across toolchains.
+
 ### Infrastructure Services
 
 ```bash
