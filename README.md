@@ -150,6 +150,7 @@ omne dev deploy --no-sign --contract ./contract.wasm --network devnet
 - `omne dev deploy` now signs every execution plan by default. Supply `--signing-key <path>` with a hex-encoded Ed25519 secret to use a managed key, or let the CLI mint an ephemeral key. Ephemeral secrets are stored beside the plan as `<plan>.signing-key` so operators can promote them into an allow-list.
 - `omne dev deploy verify <plan.json>` replays the canonical digest computation and checks the signature against the configured signer allow-list. Add extra approved keys inline with `--allowed-signer <hex>` or bypass enforcement with `--allow-unknown-signer` (not recommended for production).
 - `--no-sign` skips attaching a signature entirely—handy for local smoke tests, but hardened RPC endpoints will reject unsigned plans.
+- After a successful submission the CLI now checks the deployment metadata service (plan listings and nonce provenance) to confirm durable persistence. The canonical service list stored in the metadata layer is echoed back to the operator so discrepancies between the submitted plan and persisted record are easy to spot.
 
 ##### SDK Alignment
 
@@ -257,6 +258,9 @@ name = "testnet"
 chain_id = 1338
 rpc_endpoint = "https://testnet-rpc.omne.network"
 ws_endpoint = "wss://testnet-ws.omne.network"
+# Optional override for the deployment metadata service. By default the CLI derives
+# https://.../v1/ from the RPC endpoint when hardened deployments are enabled.
+metadata_base_url = "https://testnet-rpc.omne.network/v1/"
 
 [validator]
 enabled = true

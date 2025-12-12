@@ -15,13 +15,8 @@ use base64ct::{Base64, Encoding};
 use chrono::Utc;
 use clap::{Args, Subcommand, ValueEnum};
 use deploy_guardrails::{
-    compiler_signers_vec_for_network,
-    enforce_allowed_services,
-    validate_execution_guardrails,
-    verify_metadata_signature,
-    CompilerMetadata,
-    CompilerMetadataSignature,
-    PlanSignatureData,
+    compiler_signers_vec_for_network, enforce_allowed_services, validate_execution_guardrails,
+    verify_metadata_signature, CompilerMetadata, CompilerMetadataSignature, PlanSignatureData,
     SignerAllowList,
 };
 use dialoguer::Select;
@@ -29,8 +24,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use hex;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use reqwest::{header::AUTHORIZATION, Client, StatusCode};
-use serde::{Deserialize, Serialize};
+use reqwest::{header::AUTHORIZATION, Client, StatusCode, Url};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{self, json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -612,8 +607,7 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
             Ok(Some(attachment)) => {
                 info!(
                     "   Compiler metadata version {} (compiler {})",
-                    attachment.metadata.metadata_version,
-                    attachment.metadata.compiler_version
+                    attachment.metadata.metadata_version, attachment.metadata.compiler_version
                 );
                 if !attachment.metadata.host_functions.is_empty() {
                     info!(
@@ -632,7 +626,8 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
             Err(err) => {
                 bail!(
                     "failed to load compiler metadata for {}: {}",
-                    contract_path, err
+                    contract_path,
+                    err
                 );
             }
         };
@@ -779,8 +774,33 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
                     receipt_path.display()
                 );
 
+                match confirm_metadata_registration(config, &execution_plan, &receipt).await {
+                    Ok(Some(services)) if !services.is_empty() => {
+                        published_services = services;
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        warn!("   Metadata verification skipped: {}", err);
+                    }
+                }
+
                 if let Some(raw) = receipt.extra.get("raw") {
                     info!("   Additional deployment metadata: {}", raw);
+                }
+
+                match confirm_metadata_registration(config, &execution_plan, &receipt).await {
+                    Ok(Some(services)) => {
+                        if !services.is_empty() {
+                            info!("   Metadata-confirmed services: {}", services.join(", "));
+                            published_services = services.clone();
+                        }
+                    }
+                    Ok(None) => {
+                        // Metadata disabled; nothing to log.
+                    }
+                    Err(err) => {
+                        warn!("   Failed to confirm metadata persistence: {}", err);
+                    }
                 }
             }
             Ok(None) => {
@@ -1003,7 +1023,9 @@ async fn manage_local_env(action: LocalCommands, _config: &Config) -> Result<()>
     Ok(())
 }
 
-async fn load_compiler_attachment(module: &wasm::ContractModule) -> Result<Option<CompilerAttachment>> {
+async fn load_compiler_attachment(
+    module: &wasm::ContractModule,
+) -> Result<Option<CompilerAttachment>> {
     let metadata_path = module.path().with_extension("metadata.json");
 
     match fs::metadata(&metadata_path).await {
@@ -1012,17 +1034,28 @@ async fn load_compiler_attachment(module: &wasm::ContractModule) -> Result<Optio
             return Ok(None);
         }
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("failed to inspect compiler metadata at {}", metadata_path.display()));
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to inspect compiler metadata at {}",
+                    metadata_path.display()
+                )
+            });
         }
     }
 
-    let bytes = fs::read(&metadata_path)
-        .await
-        .with_context(|| format!("failed to read compiler metadata from {}", metadata_path.display()))?;
+    let bytes = fs::read(&metadata_path).await.with_context(|| {
+        format!(
+            "failed to read compiler metadata from {}",
+            metadata_path.display()
+        )
+    })?;
 
-    let envelope: CompilerMetadataEnvelope = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse compiler metadata JSON from {}", metadata_path.display()))?;
+    let envelope: CompilerMetadataEnvelope = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "failed to parse compiler metadata JSON from {}",
+            metadata_path.display()
+        )
+    })?;
 
     Ok(Some(CompilerAttachment {
         metadata: envelope.metadata,
@@ -1177,6 +1210,274 @@ async fn submit_execution_plan(
     Ok(envelope.result.map(DeploymentReceipt::from_value))
 }
 
+async fn confirm_metadata_registration(
+    config: &Config,
+    plan: &ExecutionPlan,
+    receipt: &DeploymentReceipt,
+) -> Result<Option<Vec<String>>> {
+    let Some(metadata_client) = MetadataClient::new(config)? else {
+        info!("   Metadata endpoints not configured; skipping verification.");
+        return Ok(None);
+    };
+
+    let digest_bytes = compute_plan_digest(plan)?;
+    let digest_hex = hex::encode(digest_bytes);
+    let digest_prefix_len = 12.min(digest_hex.len());
+    let plan_id = format!("pln_{}", &digest_hex[..digest_prefix_len]);
+
+    info!(
+        "   Verifying metadata persistence for plan {} (digest {})",
+        plan_id, digest_hex
+    );
+
+    let mut canonical_services: Option<Vec<String>> = None;
+
+    match metadata_client.fetch_plan_by_id(&plan_id).await? {
+        MetadataFetch::Found(details) => {
+            info!(
+                "   Metadata store confirmed plan {} (submitted_at: {})",
+                details.plan.plan_id, details.submitted_at
+            );
+            if !details.plan.services.is_empty() {
+                info!("   Metadata services: {}", details.plan.services.join(", "));
+                canonical_services = Some(details.plan.services.clone());
+            }
+        }
+        MetadataFetch::NotFound => {
+            info!(
+                "   Plan {} not present via ID lookup; retrying by digest...",
+                plan_id
+            );
+            match metadata_client.fetch_plan_by_digest(&digest_hex).await? {
+                MetadataFetch::Found(details) => {
+                    info!(
+                        "   Metadata store confirmed plan {} via digest (submitted_at: {})",
+                        details.plan.plan_id, details.submitted_at
+                    );
+                    if !details.plan.services.is_empty() {
+                        info!("   Metadata services: {}", details.plan.services.join(", "));
+                        canonical_services = Some(details.plan.services.clone());
+                    }
+                }
+                MetadataFetch::NotFound => {
+                    warn!(
+                        "   Deployment metadata not yet available for plan {}; persistence may be delayed.",
+                        plan_id
+                    );
+                }
+                MetadataFetch::Disabled => {
+                    info!("   Metadata endpoints are disabled on this node.");
+                    return Ok(None);
+                }
+            }
+        }
+        MetadataFetch::Disabled => {
+            info!("   Metadata endpoints are disabled on this node.");
+            return Ok(None);
+        }
+    }
+
+    let nonce_source = receipt
+        .deployment_nonce
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| plan.contract.deployment_nonce.as_str());
+
+    if !nonce_source.is_empty() {
+        let nonce_hash = hash_nonce(nonce_source);
+        match metadata_client.fetch_nonce_provenance(&nonce_hash).await? {
+            MetadataFetch::Found(provenance) => {
+                info!(
+                    "   Nonce provenance linked to plan {} (first_seen_at: {})",
+                    provenance.plan_id, provenance.first_seen_at
+                );
+            }
+            MetadataFetch::NotFound => {
+                warn!(
+                    "   Nonce provenance for hash {} not found; persistence may still be in progress.",
+                    nonce_hash
+                );
+            }
+            MetadataFetch::Disabled => {
+                info!("   Metadata endpoints are disabled on this node.");
+                return Ok(None);
+            }
+        }
+    }
+
+    Ok(canonical_services)
+}
+
+struct MetadataClient {
+    client: Client,
+    base: Url,
+    auth_header: Option<String>,
+}
+
+impl MetadataClient {
+    fn new(config: &Config) -> Result<Option<Self>> {
+        let Some(base) = derive_metadata_base_url(config)? else {
+            return Ok(None);
+        };
+
+        Ok(Some(Self {
+            client: Client::new(),
+            base,
+            auth_header: config
+                .network
+                .auth_token
+                .as_ref()
+                .map(|token| normalise_bearer_token(token)),
+        }))
+    }
+
+    async fn fetch_plan_by_id(&self, plan_id: &str) -> Result<MetadataFetch<MetadataPlanDetails>> {
+        self.get(&format!("plans/{}", plan_id)).await
+    }
+
+    async fn fetch_plan_by_digest(
+        &self,
+        digest: &str,
+    ) -> Result<MetadataFetch<MetadataPlanDetails>> {
+        self.get(&format!("plans/digest/{}", digest)).await
+    }
+
+    async fn fetch_nonce_provenance(
+        &self,
+        nonce_hash: &str,
+    ) -> Result<MetadataFetch<MetadataNonceProvenance>> {
+        self.get(&format!("provenance/{}", nonce_hash)).await
+    }
+
+    async fn get<T>(&self, path: &str) -> Result<MetadataFetch<T>>
+    where
+        T: DeserializeOwned,
+    {
+        let url = self
+            .base
+            .join(path)
+            .with_context(|| format!("failed to build metadata URL for path {}", path))?;
+        let url_display = url.to_string();
+
+        let mut request = self.client.get(url.clone());
+        if let Some(header) = self.auth_header.as_ref() {
+            request = request.header(AUTHORIZATION, header);
+        }
+
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("failed to query metadata endpoint {}", url_display))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .with_context(|| format!("failed to read metadata response from {}", url_display))?;
+
+        match status {
+            StatusCode::OK => {
+                let payload = serde_json::from_str::<T>(&body).with_context(|| {
+                    format!("failed to parse metadata response from {}", url_display)
+                })?;
+                Ok(MetadataFetch::Found(payload))
+            }
+            StatusCode::NOT_FOUND => Ok(MetadataFetch::NotFound),
+            StatusCode::NOT_IMPLEMENTED => Ok(MetadataFetch::Disabled),
+            other => {
+                if body.is_empty() {
+                    bail!(
+                        "metadata endpoint {} returned status {} with no payload",
+                        url_display,
+                        other
+                    );
+                } else {
+                    bail!(
+                        "metadata endpoint {} returned status {}: {}",
+                        url_display,
+                        other,
+                        body
+                    );
+                }
+            }
+        }
+    }
+}
+
+enum MetadataFetch<T> {
+    Found(T),
+    NotFound,
+    Disabled,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetadataPlanDetails {
+    plan: MetadataPlanSummary,
+    submitted_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetadataPlanSummary {
+    plan_id: String,
+    #[serde(default)]
+    services: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetadataNonceProvenance {
+    plan_id: String,
+    first_seen_at: String,
+}
+
+fn derive_metadata_base_url(config: &Config) -> Result<Option<Url>> {
+    if let Some(explicit) = config.network.metadata_base_url.as_ref() {
+        let mut url = Url::parse(explicit)
+            .with_context(|| format!("invalid metadata_base_url configured: {}", explicit))?;
+        ensure_trailing_slash(&mut url);
+        return Ok(Some(url));
+    }
+
+    match Url::parse(&config.network.rpc_endpoint) {
+        Ok(mut url) => {
+            url.set_path("/v1/");
+            url.set_query(None);
+            url.set_fragment(None);
+            Ok(Some(url))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+fn ensure_trailing_slash(url: &mut Url) {
+    let mut path = url.path().to_string();
+    if path.is_empty() {
+        path.push('/');
+    } else if !path.ends_with('/') {
+        path.push('/');
+    }
+    url.set_path(&path);
+}
+
+fn normalise_bearer_token(token: &str) -> String {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+
+    if trimmed.to_ascii_lowercase().starts_with("bearer ") {
+        trimmed.to_string()
+    } else {
+        format!("Bearer {}", trimmed)
+    }
+}
+
+fn hash_nonce(nonce: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(nonce.as_bytes());
+    let digest = hasher.finalize();
+    hex::encode(digest)
+}
+
 fn build_execution_plan(
     module: &wasm::ContractModule,
     method: &wasm::ContractMethod,
@@ -1236,9 +1537,7 @@ fn build_execution_plan(
             let signature = attachment.signature.as_ref().ok_or_else(|| {
                 anyhow!(
                     "compiler metadata for {} is unsigned; re-run compiler with signing enabled",
-                    module
-                        .path()
-                        .display()
+                    module.path().display()
                 )
             })?;
 
@@ -1248,11 +1547,13 @@ fn build_execution_plan(
                 config.network.allowed_compiler_signers.clone()
             };
 
-            let allow_list = SignerAllowList::from_hex_iter(allow_entries.iter().map(|s| s.as_str()))
-                .map_err(|err| anyhow!(err.to_string()))?;
+            let allow_list =
+                SignerAllowList::from_hex_iter(allow_entries.iter().map(|s| s.as_str()))
+                    .map_err(|err| anyhow!(err.to_string()))?;
 
-            let verifying_key = verify_metadata_signature(&attachment.metadata, signature, Some(&allow_list))
-                .map_err(|err| anyhow!(err.to_string()))?;
+            let verifying_key =
+                verify_metadata_signature(&attachment.metadata, signature, Some(&allow_list))
+                    .map_err(|err| anyhow!(err.to_string()))?;
 
             info!(
                 "   Compiler metadata signature verified (signer {})",
@@ -1437,7 +1738,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use httptest::{
         matchers::{all_of, matches, request},
-        responders::json_encoded,
+        responders::{json_encoded, status_code},
         Expectation, Server,
     };
     use serde_json::json;
@@ -1489,10 +1790,7 @@ mod tests {
             metadata_version: "1.0".to_string(),
             compiler_version: "test-suite".to_string(),
             generated_at: "2024-01-01T00:00:00Z".to_string(),
-            source_path: module
-                .path()
-                .to_str()
-                .map(|value| value.to_string()),
+            source_path: module.path().to_str().map(|value| value.to_string()),
             wasm_sha256: wasm_sha256.clone(),
             wasm_size_bytes: module.bytes().len(),
             contracts: compiler_contracts,
@@ -1705,6 +2003,87 @@ mod tests {
 
         let receipt = response.expect("deployment result");
         assert_eq!(receipt.contract_address.as_deref(), Some("omne1deadbeef"));
+
+        server.verify_and_clear();
+    }
+
+    #[tokio::test]
+    async fn confirm_metadata_registration_fetches_plan_and_provenance() {
+        let module = load_demo_module().await;
+        let metadata = module.metadata();
+        let method = metadata
+            .resolve_method("Demo::init")
+            .expect("method present");
+
+        let mut config = Config::default();
+        let plan = build_execution_plan(&module, method, DeployTier::Standard, &[], &config, None)
+            .expect("plan build");
+
+        let digest = hex::encode(compute_plan_digest(&plan).expect("digest"));
+        let plan_id_prefix = format!("pln_{}", &digest[..12.min(digest.len())]);
+        let nonce_hash = hash_nonce(plan.contract.deployment_nonce.as_str());
+
+        let plan_id_path: &'static str =
+            Box::leak(format!("/v1/plans/{}", plan_id_prefix).into_boxed_str());
+        let plan_digest_path: &'static str =
+            Box::leak(format!("/v1/plans/digest/{}", digest).into_boxed_str());
+        let provenance_path: &'static str =
+            Box::leak(format!("/v1/provenance/{}", nonce_hash).into_boxed_str());
+
+        let mut server = Server::run();
+        let metadata_base = server.url("/rpc");
+        config.network.rpc_endpoint = metadata_base.to_string();
+        config.network.auth_token = Some("test-token".to_string());
+
+        server.expect(
+            Expectation::matching(request::method_path("GET", plan_id_path))
+                .respond_with(status_code(StatusCode::NOT_FOUND.as_u16())),
+        );
+
+        server.expect(
+            Expectation::matching(request::method_path("GET", plan_digest_path)).respond_with(
+                json_encoded(json!({
+                    "plan": {
+                        "plan_id": plan_id_prefix.clone(),
+                        "digest": digest.clone(),
+                        "network": config.network.name.clone(),
+                        "operator_id": "operator-demo",
+                        "signer_key": "signer-demo",
+                        "compiler_signer": null,
+                        "services": ["svc-demo"],
+                        "deployment_nonce": plan.contract.deployment_nonce.clone(),
+                        "submitted_at": "2025-01-01T00:00:00Z"
+                    },
+                    "plan_body": {"services": []},
+                    "submitted_at": "2025-01-01T00:00:00Z"
+                })),
+            ),
+        );
+
+        server.expect(
+            Expectation::matching(request::method_path("GET", provenance_path)).respond_with(
+                json_encoded(json!({
+                    "nonce_hash": nonce_hash,
+                    "plan_id": plan_id_prefix.clone(),
+                    "operator_id": "operator-demo",
+                    "signer_key": "signer-demo",
+                    "compiler_signer": null,
+                    "digest": digest,
+                    "first_seen_at": "2025-01-01T00:00:01Z"
+                })),
+            ),
+        );
+
+        let receipt = DeploymentReceipt {
+            deployment_nonce: Some(plan.contract.deployment_nonce.clone()),
+            ..DeploymentReceipt::default()
+        };
+
+        let services = confirm_metadata_registration(&config, &plan, &receipt)
+            .await
+            .expect("metadata confirmation succeeds");
+
+        assert_eq!(services, Some(vec!["svc-demo".to_string()]));
 
         server.verify_and_clear();
     }
