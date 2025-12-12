@@ -38,6 +38,8 @@ pub struct NetworkConfig {
     pub auth_token: Option<String>,
     #[serde(default)]
     pub rate_limit_per_minute: Option<u64>,
+    #[serde(default)]
+    pub metadata_base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +115,7 @@ impl Default for Config {
                 allowed_compiler_signers: compiler_signers_vec_for_network("testnet"),
                 auth_token: None,
                 rate_limit_per_minute: Some(60),
+                metadata_base_url: None,
             },
             node: NodeConfig {
                 data_dir: dirs::home_dir()
