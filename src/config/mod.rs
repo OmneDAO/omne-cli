@@ -215,8 +215,8 @@ pub fn get_data_dir() -> Result<PathBuf> {
 
 fn apply_network_preset(config: &mut Config, network: &str) {
     match network {
-        "mainnet" => {
-            config.network.name = "mainnet".to_string();
+        "mainnet" | "omne_mainnet" => {
+            config.network.name = network.to_string();
             config.network.chain_id = 1337;
             config.network.rpc_endpoint = "https://rpc.omne.network".to_string();
             config.network.ws_endpoint = "wss://ws.omne.network".to_string();
@@ -230,8 +230,8 @@ fn apply_network_preset(config: &mut Config, network: &str) {
             config.network.allowed_compiler_signers = compiler_signers_vec_for_network("mainnet");
             config.network.rate_limit_per_minute = Some(120);
         }
-        "devnet" => {
-            config.network.name = "devnet".to_string();
+        "devnet" | "omne_devnet" => {
+            config.network.name = network.to_string();
             config.network.chain_id = 1339;
             config.network.rpc_endpoint = "http://localhost:8545".to_string();
             config.network.ws_endpoint = "ws://localhost:8546".to_string();
@@ -241,8 +241,22 @@ fn apply_network_preset(config: &mut Config, network: &str) {
             config.network.allowed_compiler_signers = compiler_signers_vec_for_network("devnet");
             config.network.rate_limit_per_minute = None;
         }
+        "testnet" | "omne_testnet" => {
+            config.network.name = network.to_string();
+            config.network.chain_id = 1338;
+            config.network.rpc_endpoint = "https://testnet-rpc.omne.network".to_string();
+            config.network.ws_endpoint = "wss://testnet-ws.omne.network".to_string();
+            config.network.explorer_url = "https://testnet-explorer.omne.network".to_string();
+            config.network.allowed_services =
+                vec!["orchestrator".to_string(), "analytics".to_string()];
+            config.network.allowed_signers = signers_vec_for_network("testnet");
+            config.network.allowed_compiler_signers = compiler_signers_vec_for_network("testnet");
+            config.network.auth_token = None;
+            config.network.rate_limit_per_minute = Some(60);
+            config.network.metadata_base_url = None;
+        }
         _ => {
-            // Default testnet configuration is already set
+            // Unknown networks keep the default configuration
         }
     }
 }
