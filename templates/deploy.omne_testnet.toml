@@ -1,0 +1,8 @@
+template_name = "Omne Testnet Preset"
+network = "omne_testnet"
+contract = "./artifacts/contract.wasm"
+entry = "Contract::entry_point"
+plan = "./deployments/contract.execution.json"
+services = ["orchestrator", "analytics"]
+tier = "standard"
+allow_unknown_services = false

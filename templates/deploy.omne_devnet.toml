@@ -1,0 +1,10 @@
+template_name = "Omne Devnet Preset"
+network = "omne_devnet"
+# Update with the relative path to your compiled Wasm artefact.
+contract = "./artifacts/contract.wasm"
+# Replace with the contract entry you intend to execute.
+entry = "Contract::entry_point"
+plan = "./deployments/contract.execution.json"
+services = ["orchestrator"]
+tier = "fastvm"
+allow_unknown_services = true

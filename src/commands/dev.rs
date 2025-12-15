@@ -35,7 +35,8 @@ use std::time::Duration;
 use tokio::fs;
 use tracing::{info, warn};
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Debug, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DeployTier {
     Fastvm,
     Standard,
@@ -197,6 +198,10 @@ pub struct DeployArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct DeployPlanArgs {
+    /// Deployment template that pre-fills plan options
+    #[arg(long)]
+    pub template: Option<String>,
+
     /// Contract WASM file path
     #[arg(long)]
     pub contract: Option<String>,
@@ -214,8 +219,8 @@ pub struct DeployPlanArgs {
     pub services: Vec<String>,
 
     /// Target network
-    #[arg(long, default_value = "testnet")]
-    pub network: String,
+    #[arg(long)]
+    pub network: Option<String>,
 
     /// Authentication token for hardened deployment endpoint
     #[arg(long)]
@@ -226,8 +231,8 @@ pub struct DeployPlanArgs {
     pub allow_unknown_services: bool,
 
     /// Execution tier for generated config
-    #[arg(long, value_enum, default_value_t = DeployTier::Standard)]
-    pub tier: DeployTier,
+    #[arg(long, value_enum)]
+    pub tier: Option<DeployTier>,
 
     /// Path to Ed25519 signing key (hex-encoded) for execution plan attestation
     #[arg(long)]
@@ -241,14 +246,15 @@ pub struct DeployPlanArgs {
 impl Default for DeployPlanArgs {
     fn default() -> Self {
         Self {
+            template: None,
             contract: None,
             entry: None,
             plan: None,
             services: Vec::new(),
-            network: "testnet".to_string(),
+            network: None,
             auth_token: None,
             allow_unknown_services: false,
-            tier: DeployTier::Standard,
+            tier: None,
             signing_key: None,
             no_sign: false,
         }
@@ -268,6 +274,146 @@ pub struct DeployVerifyArgs {
     /// Additional signer public keys (hex) to permit during verification
     #[arg(long = "allowed-signer", value_name = "HEX", action = clap::ArgAction::Append)]
     pub allowed_signer: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct DeployPlanTemplate {
+    template_name: Option<String>,
+    contract: Option<String>,
+    entry: Option<String>,
+    plan: Option<String>,
+    services: Vec<String>,
+    network: Option<String>,
+    auth_token: Option<String>,
+    allow_unknown_services: Option<bool>,
+    tier: Option<DeployTier>,
+    signing_key: Option<String>,
+    no_sign: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedDeployPlan {
+    template_name: Option<String>,
+    contract: Option<String>,
+    entry: Option<String>,
+    plan_path: Option<String>,
+    services: Vec<String>,
+    network: String,
+    auth_token: Option<String>,
+    allow_unknown_services: bool,
+    tier: DeployTier,
+    signing_key: Option<String>,
+    no_sign: bool,
+}
+
+async fn resolve_plan_args(args: &DeployPlanArgs, config: &Config) -> Result<ResolvedDeployPlan> {
+    let mut template = DeployPlanTemplate::default();
+
+    if let Some(template_path) = args.template.as_deref() {
+        let path = PathBuf::from(template_path);
+        let bytes = fs::read(&path)
+            .await
+            .with_context(|| format!("failed to read deployment template {}", path.display()))?;
+
+        let mut parsed: DeployPlanTemplate = match path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("yml") | Some("yaml") => serde_yaml::from_slice(&bytes).with_context(|| {
+                format!(
+                    "failed to parse YAML deployment template {}",
+                    path.display()
+                )
+            })?,
+            _ => {
+                let text = std::str::from_utf8(&bytes).with_context(|| {
+                    format!("deployment template {} is not valid UTF-8", path.display())
+                })?;
+                toml::from_str(text).with_context(|| {
+                    format!(
+                        "failed to parse TOML deployment template {}",
+                        path.display()
+                    )
+                })?
+            }
+        };
+
+        if parsed.template_name.is_none() {
+            parsed.template_name = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(|stem| stem.to_string());
+        }
+
+        template = parsed;
+    }
+
+    let template_name = template.template_name.clone();
+
+    let contract = args.contract.clone().or_else(|| template.contract.clone());
+
+    let entry = args.entry.clone().or_else(|| template.entry.clone());
+
+    let plan_path = args.plan.clone().or_else(|| template.plan.clone());
+
+    let services = if !args.services.is_empty() {
+        args.services.clone()
+    } else if !template.services.is_empty() {
+        template.services.clone()
+    } else {
+        Vec::new()
+    };
+
+    let network = args
+        .network
+        .clone()
+        .or_else(|| template.network.clone())
+        .unwrap_or_else(|| config.network.name.clone());
+
+    let auth_token = args
+        .auth_token
+        .clone()
+        .or_else(|| template.auth_token.clone());
+
+    let allow_unknown_services = if args.allow_unknown_services {
+        true
+    } else {
+        template.allow_unknown_services.unwrap_or(false)
+    };
+
+    let tier = args
+        .tier
+        .clone()
+        .or_else(|| template.tier.clone())
+        .unwrap_or(DeployTier::Standard);
+
+    let signing_key = args
+        .signing_key
+        .clone()
+        .or_else(|| template.signing_key.clone());
+
+    let no_sign = if args.no_sign {
+        true
+    } else {
+        template.no_sign.unwrap_or(false)
+    };
+
+    Ok(ResolvedDeployPlan {
+        template_name,
+        contract,
+        entry,
+        plan_path,
+        services,
+        network,
+        auth_token,
+        allow_unknown_services,
+        tier,
+        signing_key,
+        no_sign,
+    })
 }
 
 #[derive(Subcommand)]
@@ -468,17 +614,29 @@ async fn run_tests(
 }
 
 async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
-    info!("🚀 Deploying to Omne {} network", args.network);
+    let resolved = resolve_plan_args(args, config).await?;
 
-    if args.network == "mainnet" && !confirm("Deploy to MAINNET? This will use real funds.")? {
+    if let Some(name) = resolved.template_name.as_deref() {
+        info!("📝 Using deployment template: {}", name);
+    }
+
+    if resolved.network != config.network.name {
+        warn!(
+            "Deployment template targets '{}' but CLI configuration is initialised for '{}'.",
+            resolved.network, config.network.name
+        );
+    }
+
+    info!("🚀 Deploying to Omne {} network", resolved.network);
+
+    if resolved.network == "mainnet" && !confirm("Deploy to MAINNET? This will use real funds.")? {
         info!("Deployment cancelled");
         return Ok(());
     }
 
-    let effective_auth_token = args
+    let effective_auth_token = resolved
         .auth_token
-        .as_ref()
-        .map(|token| token.to_string())
+        .clone()
         .or_else(|| config.network.auth_token.clone())
         .or_else(|| {
             std::env::var("OMNE_AUTH_TOKEN")
@@ -487,12 +645,12 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
         });
 
     let service_selection = enforce_allowed_services(
-        &args.services,
+        &resolved.services,
         &config.network.allowed_services,
-        args.allow_unknown_services,
+        resolved.allow_unknown_services,
     )
     .map_err(|err| {
-        if args.allow_unknown_services {
+        if resolved.allow_unknown_services {
             anyhow!(err)
         } else {
             anyhow!("{} Pass --allow-unknown-services to override.", err)
@@ -500,7 +658,7 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
     })?;
     let mut published_services = service_selection.clone();
 
-    if args.allow_unknown_services && !config.network.allowed_services.is_empty() {
+    if resolved.allow_unknown_services && !config.network.allowed_services.is_empty() {
         warn!("Bypassing service allow-list validation; proceed with caution.");
     } else if config.network.allowed_services.is_empty() && !service_selection.is_empty() {
         warn!(
@@ -513,7 +671,7 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
         info!("🔐 Authentication token detected; including Authorization header");
     }
 
-    if let Some(contract_path) = args.contract.as_deref() {
+    if let Some(contract_path) = resolved.contract.as_deref() {
         info!("📦 Deploying contract: {}", contract_path);
         let analysis = spinner("Analyzing contract module...");
         let module = wasm::load_contract_module(contract_path).await?;
@@ -551,7 +709,7 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
                 "contract module does not expose any ABI metadata; regenerate with the latest compiler"
             );
         }
-        let selected_method = if let Some(selector) = args.entry.as_deref() {
+        let selected_method = if let Some(selector) = resolved.entry.as_deref() {
             metadata
                 .resolve_method(selector)
                 .ok_or_else(|| anyhow!("no contract export named '{}' found", selector))?
@@ -595,10 +753,10 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
                 info!("   Legacy export retained as {}", legacy);
             }
         }
-        info!("   Execution tier: {}", args.tier);
+        info!("   Execution tier: {}", resolved.tier);
 
-        let plan_path = args
-            .plan
+        let plan_path = resolved
+            .plan_path
             .as_ref()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(contract_path).with_extension("execution.json"));
@@ -635,7 +793,7 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
         let mut execution_plan = build_execution_plan(
             &module,
             selected_method,
-            args.tier.clone(),
+            resolved.tier.clone(),
             &service_selection,
             config,
             compiler_attachment.clone(),
@@ -643,9 +801,9 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
 
         let mut plan_signer: Option<[u8; 32]> = None;
 
-        if args.no_sign {
+        if resolved.no_sign {
             warn!("⚠️ Skipping plan signing; hardened endpoints will reject unsigned submissions.");
-        } else if let Some(key_path) = args.signing_key.as_deref() {
+        } else if let Some(key_path) = resolved.signing_key.as_deref() {
             let verifying_key = sign_execution_plan(&mut execution_plan, key_path).await?;
             let verifying_hex = hex::encode(verifying_key);
             info!(
@@ -825,7 +983,7 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
     }
 
     info!("✅ Deployment complete!");
-    info!("   Network: {}", args.network);
+    info!("   Network: {}", resolved.network);
     let services_str = if published_services.is_empty() {
         "None".to_string()
     } else {

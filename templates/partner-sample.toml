@@ -1,0 +1,9 @@
+template_name = "Partner Settlement"
+network = "testnet"
+contract = "./artifacts/partner_contract.wasm"
+entry = "PartnerContract::init"
+plan = "./deployments/partner_contract.execution.json"
+services = ["analytics", "orchestrator"]
+tier = "standard"
+signing_key = "./keys/deployment.ed25519"
+allow_unknown_services = false

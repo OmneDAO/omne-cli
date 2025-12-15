@@ -152,6 +152,31 @@ omne dev deploy --no-sign --contract ./contract.wasm --network devnet
 - `--no-sign` skips attaching a signature entirely—handy for local smoke tests, but hardened RPC endpoints will reject unsigned plans.
 - After a successful submission the CLI now checks the deployment metadata service (plan listings and nonce provenance) to confirm durable persistence. The canonical service list stored in the metadata layer is echoed back to the operator so discrepancies between the submitted plan and persisted record are easy to spot.
 
+#### Deployment Templates
+
+- Use `--template <path>` to preload deployment inputs from TOML or YAML. CLI flags still override template values, while any missing field falls back to the active Omne configuration.
+- Example template (`templates/partner-sample.toml`):
+
+```toml
+template_name = "Partner Settlement"
+network = "testnet"
+contract = "./artifacts/partner_contract.wasm"
+entry = "PartnerContract::init"
+plan = "./deployments/partner_contract.execution.json"
+services = ["analytics", "orchestrator"]
+tier = "standard"
+signing_key = "./keys/deployment.ed25519"
+allow_unknown_services = false
+```
+
+- Override specific inputs at call-time, for example:
+
+```bash
+omne dev deploy --template templates/partner-sample.toml --contract ./artifacts/partner_contract_v2.wasm --services analytics
+```
+- Templates keep multi-team deployments consistent—ship a curated file alongside your artifacts and operators can reproduce the exact execution plan shape across environments.
+- Omne ships environment presets under `templates/deploy.omne_devnet.toml`, `templates/deploy.omne_testnet.toml`, and `templates/deploy.omne_mainnet.toml`; copy one as a starting point and drop in your own artefact path, entry, and service mix.
+
 ##### SDK Alignment
 
 - The TypeScript SDK exposes the same hardened submission flow via `omneClient.deployExecutionPlan(plan, options)` and low-level helpers such as `generateDeploymentNonce`, `buildDeploymentHeaders`, and `ensureSignedCompilerAttachment`. This allows backend services or CI pipelines to reuse the CLI’s guardrail logic when calling the `/v1/deployments` API directly.

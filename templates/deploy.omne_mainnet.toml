@@ -1,0 +1,8 @@
+template_name = "Omne Mainnet Preset"
+network = "omne_mainnet"
+contract = "./artifacts/contract.wasm"
+entry = "Contract::entry_point"
+plan = "./deployments/contract.execution.json"
+services = ["orchestrator", "analytics", "security"]
+tier = "standard"
+allow_unknown_services = false
