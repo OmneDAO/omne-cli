@@ -114,6 +114,7 @@ async fn main() -> Result<()> {
 
     // Load configuration
     let config = config::load_config(cli.config.as_deref(), &cli.network).await?;
+    utils::prime_rpc_auth(&config);
 
     // Execute command
     let result = match cli.command {

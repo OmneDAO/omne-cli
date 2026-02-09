@@ -1,7 +1,7 @@
 //! Network-level operations and management commands
 
 use crate::config::Config;
-use crate::utils::{confirm, spinner};
+use crate::utils::{confirm, rpc_post, spinner};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use clap::Subcommand;
@@ -147,9 +147,9 @@ async fn show_network_status(
     if let Some(interval) = watch {
         warn!("🔄 Live monitoring enabled ({}s interval)", interval);
         loop {
-            match fetch_node_status(endpoint).await {
+            match fetch_node_status(endpoint, config).await {
                 Ok(status) => {
-                    let consensus = match fetch_consensus_metrics(endpoint).await {
+                    let consensus = match fetch_consensus_metrics(endpoint, config).await {
                         Ok(metrics) => Some(metrics),
                         Err(err) => {
                             warn!("⚠️  Failed to fetch consensus telemetry: {}", err);
@@ -163,7 +163,7 @@ async fn show_network_status(
             sleep(Duration::from_secs(interval)).await;
         }
     } else {
-        let status = fetch_node_status(endpoint)
+        let status = fetch_node_status(endpoint, config)
             .await
             .map_err(|err| {
                 warn!(
@@ -173,7 +173,7 @@ async fn show_network_status(
                 );
                 err
             })?;
-        let consensus = match fetch_consensus_metrics(endpoint).await {
+        let consensus = match fetch_consensus_metrics(endpoint, config).await {
             Ok(metrics) => Some(metrics),
             Err(err) => {
                 warn!("⚠️  Failed to fetch consensus telemetry: {}", err);
@@ -271,7 +271,7 @@ async fn render_simulated_status(detailed: bool, watch: Option<u64>) {
     }
 }
 
-async fn fetch_node_status(endpoint: &str) -> Result<NodeStatusResponse> {
+async fn fetch_node_status(endpoint: &str, config: &Config) -> Result<NodeStatusResponse> {
     let client = reqwest::Client::new();
     let payload = serde_json::json!({
         "jsonrpc": "2.0",
@@ -280,8 +280,7 @@ async fn fetch_node_status(endpoint: &str) -> Result<NodeStatusResponse> {
         "id": 1,
     });
 
-    let response = client
-        .post(endpoint)
+    let response = rpc_post(&client, endpoint, config)
         .json(&payload)
         .send()
         .await
@@ -304,7 +303,10 @@ async fn fetch_node_status(endpoint: &str) -> Result<NodeStatusResponse> {
         .ok_or_else(|| anyhow!("RPC response missing result"))
 }
 
-async fn fetch_consensus_metrics(endpoint: &str) -> Result<ConsensusTelemetryResponse> {
+async fn fetch_consensus_metrics(
+    endpoint: &str,
+    config: &Config,
+) -> Result<ConsensusTelemetryResponse> {
     let client = reqwest::Client::new();
     let payload = serde_json::json!({
         "jsonrpc": "2.0",
@@ -313,8 +315,7 @@ async fn fetch_consensus_metrics(endpoint: &str) -> Result<ConsensusTelemetryRes
         "id": 1,
     });
 
-    let response = client
-        .post(endpoint)
+    let response = rpc_post(&client, endpoint, config)
         .json(&payload)
         .send()
         .await

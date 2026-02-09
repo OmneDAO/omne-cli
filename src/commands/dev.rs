@@ -639,6 +639,11 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
         .clone()
         .or_else(|| config.network.auth_token.clone())
         .or_else(|| {
+            std::env::var("OMNE_RPC_TOKEN")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
             std::env::var("OMNE_AUTH_TOKEN")
                 .ok()
                 .filter(|value| !value.trim().is_empty())

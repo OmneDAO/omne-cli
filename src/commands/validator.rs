@@ -1,7 +1,7 @@
 //! Validator operations and service management commands
 
 use crate::config::Config;
-use crate::utils::{confirm, spinner};
+use crate::utils::{confirm, rpc_post, spinner};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use clap::Subcommand;
@@ -151,7 +151,7 @@ pub enum ChallengeCommands {
 
 pub async fn execute(command: ValidatorCommands, config: &Config) -> Result<()> {
     if requires_rpc(&command) {
-        crate::config::probe_rpc_endpoint(&config.network.rpc_endpoint)
+        crate::config::probe_rpc_endpoint(&config.network.rpc_endpoint, config)
             .await
             .with_context(|| {
                 format!(
@@ -231,7 +231,7 @@ async fn handle_challenges(action: ChallengeCommands, config: &Config) -> Result
     match action {
         ChallengeCommands::Pending { limit } => {
             let mut challenges: Vec<ChallengeRecord> =
-                rpc_request(endpoint, "omne_getPendingChallenges", json!([])).await?;
+                rpc_request(endpoint, "omne_getPendingChallenges", json!([]), config).await?;
 
             if challenges.is_empty() {
                 info!("🎯 No pending fraud challenges reported by the node");
@@ -243,7 +243,7 @@ async fn handle_challenges(action: ChallengeCommands, config: &Config) -> Result
         }
         ChallengeCommands::Resolved { limit } => {
             let mut challenges: Vec<ChallengeRecord> =
-                rpc_request(endpoint, "omne_getResolvedChallenges", json!([])).await?;
+                rpc_request(endpoint, "omne_getResolvedChallenges", json!([]), config).await?;
 
             if challenges.is_empty() {
                 info!("ℹ️ No resolved fraud challenges recorded yet");
@@ -259,7 +259,7 @@ async fn handle_challenges(action: ChallengeCommands, config: &Config) -> Result
         }
         ChallengeCommands::Show { id } => {
             let record: Option<ChallengeRecord> =
-                rpc_request(endpoint, "omne_getChallengeById", json!([id])).await?;
+                rpc_request(endpoint, "omne_getChallengeById", json!([id]), config).await?;
 
             match record {
                 Some(record) => print_challenge_details(&record),
@@ -275,7 +275,7 @@ async fn handle_challenges(action: ChallengeCommands, config: &Config) -> Result
             };
 
             let record: Option<ChallengeRecord> =
-                rpc_request(endpoint, "omne_resolveChallenge", params).await?;
+                rpc_request(endpoint, "omne_resolveChallenge", params, config).await?;
 
             match record {
                 Some(record) => {
@@ -695,6 +695,7 @@ async fn rpc_request<T: DeserializeOwned>(
     endpoint: &str,
     method: &str,
     params: Value,
+    config: &Config,
 ) -> Result<T> {
     let client = Client::new();
     let payload = json!({
@@ -704,8 +705,7 @@ async fn rpc_request<T: DeserializeOwned>(
         "id": 1,
     });
 
-    let response = client
-        .post(endpoint)
+    let response = rpc_post(&client, endpoint, config)
         .json(&payload)
         .send()
         .await

@@ -1,5 +1,6 @@
 //! Configuration management for Omne CLI
 
+use crate::utils;
 use anyhow::{Context, Result};
 use deploy_guardrails::{compiler_signers_vec_for_network, signers_vec_for_network};
 use reqwest::Client;
@@ -333,11 +334,11 @@ fn report_unknown_keys(
 }
 
 async fn validate_network_endpoints(config: &Config) -> Result<()> {
-    probe_rpc_endpoint(&config.network.rpc_endpoint).await
+    probe_rpc_endpoint(&config.network.rpc_endpoint, config).await
 }
 
 /// Probe the configured RPC endpoint and return an error if it is unreachable.
-pub async fn probe_rpc_endpoint(endpoint: &str) -> Result<()> {
+pub async fn probe_rpc_endpoint(endpoint: &str, config: &Config) -> Result<()> {
     if !endpoint.starts_with("http") {
         return Ok(());
     }
@@ -347,8 +348,7 @@ pub async fn probe_rpc_endpoint(endpoint: &str) -> Result<()> {
         .build()
         .context("unable to build HTTP client for validation")?;
 
-    let response = client
-        .get(endpoint)
+    let response = utils::rpc_get(&client, endpoint, config)
         .send()
         .await
         .with_context(|| format!("failed to reach RPC endpoint {}", endpoint))?;

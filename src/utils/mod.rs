@@ -2,11 +2,17 @@
 
 #![allow(dead_code)] // Allow unused utility functions for future development
 
+use crate::config::Config;
 use anyhow::Result;
 use console::{Emoji, Style};
 use dialoguer::Confirm;
+use hex;
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::{rngs::OsRng, RngCore};
+use reqwest::{header::AUTHORIZATION, Client, RequestBuilder};
+use std::sync::OnceLock;
 use std::time::Duration;
+use tracing::warn;
 
 /// Create a spinner with a message
 pub fn spinner(message: &str) -> ProgressBar {
@@ -168,6 +174,118 @@ pub fn parse_duration(duration_str: &str) -> Result<Duration> {
     // Default to seconds if no suffix
     let seconds: u64 = duration_str.parse()?;
     Ok(Duration::from_secs(seconds))
+}
+
+static RPC_TOKEN_CACHE: OnceLock<Option<String>> = OnceLock::new();
+static RPC_WARN_ONCE: OnceLock<()> = OnceLock::new();
+
+/// Cache the RPC token derived from the active configuration so subsequent
+/// requests can reuse it without re-reading environment variables.
+pub fn prime_rpc_auth(config: &Config) {
+    let _ = RPC_TOKEN_CACHE.set(resolve_rpc_token(config));
+    if RPC_TOKEN_CACHE
+        .get()
+        .and_then(|token| token.as_ref())
+        .is_none()
+    {
+        warn_missing_rpc_token();
+    }
+}
+
+/// Build a POST request with Omne RPC headers (Authorization + nonce).
+pub fn rpc_post(client: &Client, endpoint: &str, config: &Config) -> RequestBuilder {
+    apply_rpc_headers(client.post(endpoint), config)
+}
+
+/// Build a GET request with Omne RPC headers (Authorization + nonce).
+pub fn rpc_get(client: &Client, endpoint: &str, config: &Config) -> RequestBuilder {
+    apply_rpc_headers(client.get(endpoint), config)
+}
+
+/// Attach RPC guardrail headers to an existing request builder.
+pub fn apply_rpc_headers(builder: RequestBuilder, config: &Config) -> RequestBuilder {
+    let builder = builder.header("X-Omne-Nonce", generate_rpc_nonce());
+
+    if let Some(token) = cached_rpc_token(config) {
+        builder.header(AUTHORIZATION, token)
+    } else {
+        warn_missing_rpc_token();
+        builder
+    }
+}
+
+fn cached_rpc_token(config: &Config) -> Option<String> {
+    if let Some(token) = RPC_TOKEN_CACHE.get() {
+        return token.clone();
+    }
+    resolve_rpc_token(config)
+}
+
+fn resolve_rpc_token(config: &Config) -> Option<String> {
+    rpc_token_from_env()
+        .or_else(|| {
+            config
+                .network
+                .auth_token
+                .as_deref()
+                .and_then(normalise_bearer_token)
+        })
+        .or_else(|| {
+            std::env::var("OMNE_AUTH_TOKEN")
+                .ok()
+                .and_then(|value| normalise_bearer_token(value.trim()))
+        })
+}
+
+fn rpc_token_from_env() -> Option<String> {
+    std::env::var("OMNE_RPC_TOKEN")
+        .ok()
+        .and_then(|value| normalise_bearer_token(value.trim()))
+}
+
+fn normalise_bearer_token(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    const PREFIX: &str = "bearer";
+    if trimmed.eq_ignore_ascii_case(PREFIX) {
+        return None;
+    }
+
+    if trimmed.len() > PREFIX.len() {
+        let (prefix, remainder) = trimmed.split_at(PREFIX.len());
+        if prefix.eq_ignore_ascii_case(PREFIX)
+            && remainder
+                .chars()
+                .next()
+                .map(|ch| ch.is_whitespace())
+                .unwrap_or(false)
+        {
+            let token = remainder.trim();
+            if token.is_empty() {
+                return None;
+            }
+            return Some(format!("Bearer {}", token));
+        }
+    }
+
+    Some(format!("Bearer {}", trimmed))
+}
+
+fn generate_rpc_nonce() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn warn_missing_rpc_token() {
+    if RPC_WARN_ONCE.set(()).is_ok() {
+        warn!(
+            "OMNE_RPC_TOKEN or network.auth_token not configured; RPC requests will likely be rejected once guardrails are enforced"
+        );
+    }
 }
 
 #[cfg(test)]
