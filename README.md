@@ -311,6 +311,13 @@ local_network_validators = 3
 auto_start_services = true
 ```
 
+### RPC Guardrails & Tokens
+
+- **Set `OMNE_RPC_TOKEN`** (or populate `network.auth_token` in the config file) to have every JSON-RPC call automatically include `Authorization: Bearer <token>` plus a per-request `X-Omne-Nonce`.
+- The CLI falls back to `OMNE_AUTH_TOKEN` so hardened deployment tokens can be reused for the general RPC surface when desired.
+- If no token is configured the CLI emits a warning, and guarded nodes will reject the request with `token_missing`/`nonce_missing` errors.
+- Deployment workflows (`omne dev deploy`) continue to accept `--auth-token`/`OMNE_AUTH_TOKEN`; the same token can back both deployment and operational RPC flows once added to the server-side allow-list.
+
 ## 💰 Revenue Model
 
 ### Infrastructure Services Earnings

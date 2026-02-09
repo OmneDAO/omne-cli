@@ -108,7 +108,8 @@ pub enum PaymasterCommands {
 }
 
 pub async fn execute(command: InfrastructureCommands, config: &Config) -> Result<()> {
-    if let Err(err) = crate::config::probe_rpc_endpoint(&config.network.rpc_endpoint).await {
+    if let Err(err) = crate::config::probe_rpc_endpoint(&config.network.rpc_endpoint, config).await
+    {
         warn!(
             "Unable to reach infrastructure RPC endpoint at {}: {}. Continuing with cached metrics where available.",
             config.network.rpc_endpoint, err
