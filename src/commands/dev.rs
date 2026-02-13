@@ -174,6 +174,10 @@ type PlanSignature = PlanSignatureData;
 pub enum DeployOperation {
     /// Generate and optionally submit a deployment plan
     Plan,
+    /// Submit a previously generated deployment plan
+    Submit,
+    /// Print the canonical digest for a deployment plan
+    Digest,
     /// Verify an existing deployment plan signature on disk
     Verify,
 }
@@ -191,6 +195,12 @@ pub struct DeployArgs {
 
     #[command(flatten)]
     pub plan: DeployPlanArgs,
+
+    #[command(flatten)]
+    pub submit: DeploySubmitArgs,
+
+    #[command(flatten)]
+    pub digest: DeployDigestArgs,
 
     #[command(flatten)]
     pub verify: DeployVerifyArgs,
@@ -234,6 +244,10 @@ pub struct DeployPlanArgs {
     #[arg(long, value_enum)]
     pub tier: Option<DeployTier>,
 
+    /// Skip execution preview when generating a plan
+    #[arg(long)]
+    pub skip_preview: bool,
+
     /// Path to Ed25519 signing key (hex-encoded) for execution plan attestation
     #[arg(long)]
     pub signing_key: Option<String>,
@@ -241,6 +255,18 @@ pub struct DeployPlanArgs {
     /// Disable automatic plan signing (unsafe)
     #[arg(long)]
     pub no_sign: bool,
+
+    /// Generate the plan without submitting it
+    #[arg(long)]
+    pub no_submit: bool,
+
+    /// Hex-encoded Ed25519 plan signature from an external signer (KMS)
+    #[arg(long)]
+    pub plan_signature_hex: Option<String>,
+
+    /// Hex-encoded Ed25519 public key for the external plan signature
+    #[arg(long)]
+    pub plan_signature_pubkey: Option<String>,
 }
 
 impl Default for DeployPlanArgs {
@@ -255,16 +281,49 @@ impl Default for DeployPlanArgs {
             auth_token: None,
             allow_unknown_services: false,
             tier: None,
+            skip_preview: false,
             signing_key: None,
             no_sign: false,
+            no_submit: false,
+            plan_signature_hex: None,
+            plan_signature_pubkey: None,
         }
     }
 }
 
 #[derive(Args, Debug, Clone, Default)]
+pub struct DeploySubmitArgs {
+    /// Execution plan path to submit
+    #[arg(
+        id = "submit_plan",
+        long = "submit-plan",
+        value_name = "PLAN",
+        required_if_eq("mode", "submit")
+    )]
+    pub plan: Option<String>,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct DeployDigestArgs {
+    /// Execution plan path to digest
+    #[arg(
+        id = "digest_plan",
+        long = "digest-plan",
+        value_name = "PLAN",
+        required_if_eq("mode", "digest")
+    )]
+    pub plan: Option<String>,
+}
+
+#[derive(Args, Debug, Clone, Default)]
 pub struct DeployVerifyArgs {
     /// Execution plan path to verify
-    #[arg(value_name = "PLAN", required_if_eq("mode", "verify"))]
+    #[arg(
+        id = "verify_plan",
+        long = "verify-plan",
+        value_name = "PLAN",
+        required_if_eq("mode", "verify")
+    )]
     pub plan: Option<String>,
 
     /// Skip signer allow-list enforcement
@@ -288,8 +347,12 @@ struct DeployPlanTemplate {
     auth_token: Option<String>,
     allow_unknown_services: Option<bool>,
     tier: Option<DeployTier>,
+    skip_preview: Option<bool>,
     signing_key: Option<String>,
     no_sign: Option<bool>,
+    no_submit: Option<bool>,
+    plan_signature_hex: Option<String>,
+    plan_signature_pubkey: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -303,8 +366,12 @@ struct ResolvedDeployPlan {
     auth_token: Option<String>,
     allow_unknown_services: bool,
     tier: DeployTier,
+    skip_preview: bool,
     signing_key: Option<String>,
     no_sign: bool,
+    no_submit: bool,
+    plan_signature_hex: Option<String>,
+    plan_signature_pubkey: Option<String>,
 }
 
 async fn resolve_plan_args(args: &DeployPlanArgs, config: &Config) -> Result<ResolvedDeployPlan> {
@@ -390,6 +457,12 @@ async fn resolve_plan_args(args: &DeployPlanArgs, config: &Config) -> Result<Res
         .or_else(|| template.tier.clone())
         .unwrap_or(DeployTier::Standard);
 
+    let skip_preview = if args.skip_preview {
+        true
+    } else {
+        template.skip_preview.unwrap_or(false)
+    };
+
     let signing_key = args
         .signing_key
         .clone()
@@ -401,6 +474,22 @@ async fn resolve_plan_args(args: &DeployPlanArgs, config: &Config) -> Result<Res
         template.no_sign.unwrap_or(false)
     };
 
+    let no_submit = if args.no_submit {
+        true
+    } else {
+        template.no_submit.unwrap_or(false)
+    };
+
+    let plan_signature_hex = args
+        .plan_signature_hex
+        .clone()
+        .or_else(|| template.plan_signature_hex.clone());
+
+    let plan_signature_pubkey = args
+        .plan_signature_pubkey
+        .clone()
+        .or_else(|| template.plan_signature_pubkey.clone());
+
     Ok(ResolvedDeployPlan {
         template_name,
         contract,
@@ -411,8 +500,12 @@ async fn resolve_plan_args(args: &DeployPlanArgs, config: &Config) -> Result<Res
         auth_token,
         allow_unknown_services,
         tier,
+        skip_preview,
         signing_key,
         no_sign,
+        no_submit,
+        plan_signature_hex,
+        plan_signature_pubkey,
     })
 }
 
@@ -521,6 +614,10 @@ pub async fn execute(command: DevCommands, config: &Config) -> Result<()> {
         } => run_tests(integration, performance, component.as_deref(), config).await,
         DevCommands::Deploy(args) => match args.mode {
             DeployOperation::Plan => deploy_project(&args.plan, config).await,
+            DeployOperation::Submit => {
+                submit_deployment_plan(&args.submit, &args.plan, config).await
+            }
+            DeployOperation::Digest => print_plan_digest(&args.digest).await,
             DeployOperation::Verify => {
                 verify_execution_plan(&args.verify, &args.plan, config).await
             }
@@ -632,6 +729,12 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
     if resolved.network == "mainnet" && !confirm("Deploy to MAINNET? This will use real funds.")? {
         info!("Deployment cancelled");
         return Ok(());
+    }
+
+    if resolved.network == "mainnet" && resolved.skip_preview {
+        bail!(
+            "execution preview cannot be skipped on mainnet; remove skip_preview/--skip-preview"
+        );
     }
 
     let effective_auth_token = resolved
@@ -759,6 +862,9 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
             }
         }
         info!("   Execution tier: {}", resolved.tier);
+        if resolved.skip_preview {
+            info!("   Execution preview skipped (--skip-preview)");
+        }
 
         let plan_path = resolved
             .plan_path
@@ -802,11 +908,38 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
             &service_selection,
             config,
             compiler_attachment.clone(),
+            resolved.skip_preview,
         )?;
 
         let mut plan_signer: Option<[u8; 32]> = None;
 
-        if resolved.no_sign {
+        let has_external_signature =
+            resolved.plan_signature_hex.is_some() || resolved.plan_signature_pubkey.is_some();
+
+        if has_external_signature {
+            if resolved.signing_key.is_some() {
+                bail!("Provide either --signing-key or external plan signature flags, not both");
+            }
+
+            let signature_hex = resolved.plan_signature_hex.as_deref().ok_or_else(|| {
+                anyhow!("--plan-signature-hex is required when using external signatures")
+            })?;
+            let public_key_hex = resolved.plan_signature_pubkey.as_deref().ok_or_else(|| {
+                anyhow!("--plan-signature-pubkey is required when using external signatures")
+            })?;
+
+            let verifying_key = attach_plan_signature_with_hex(
+                &mut execution_plan,
+                signature_hex,
+                public_key_hex,
+            )?;
+            let verifying_hex = hex::encode(verifying_key);
+            info!(
+                "🔏 Execution plan signed with external key {}",
+                verifying_hex
+            );
+            plan_signer = Some(verifying_key);
+        } else if resolved.no_sign {
             warn!("⚠️ Skipping plan signing; hardened endpoints will reject unsigned submissions.");
         } else if let Some(key_path) = resolved.signing_key.as_deref() {
             let verifying_key = sign_execution_plan(&mut execution_plan, key_path).await?;
@@ -894,6 +1027,11 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
 
         info!("   Execution plan written to {}", plan_path.display());
         println!("   Plan file: {}", plan_path.display());
+
+        if resolved.no_submit {
+            info!("   Plan generation complete; submission skipped (--no-submit)");
+            return Ok(());
+        }
 
         let submission = spinner("Submitting execution plan to network...");
         match submit_execution_plan(&execution_plan, config, effective_auth_token.as_deref()).await
@@ -1008,7 +1146,7 @@ async fn verify_execution_plan(
         .plan
         .as_deref()
         .or_else(|| defaults.plan.as_deref())
-        .ok_or_else(|| anyhow!("plan path must be provided (pass <PLAN> or --plan)"))?;
+        .ok_or_else(|| anyhow!("plan path must be provided (pass --verify-plan or --plan)"))?;
     let plan_path = PathBuf::from(plan_path_str);
 
     info!(
@@ -1084,6 +1222,149 @@ async fn verify_execution_plan(
         }
     }
 
+    Ok(())
+}
+
+async fn submit_deployment_plan(
+    args: &DeploySubmitArgs,
+    defaults: &DeployPlanArgs,
+    config: &Config,
+) -> Result<()> {
+    let plan_path_str = args
+        .plan
+        .as_deref()
+        .ok_or_else(|| anyhow!("plan path must be provided (pass --submit-plan)"))?;
+    let plan_path = PathBuf::from(plan_path_str);
+
+    info!("📤 Submitting execution plan at {}", plan_path.display());
+
+    let plan_bytes = fs::read(&plan_path)
+        .await
+        .with_context(|| format!("failed to read execution plan from {}", plan_path.display()))?;
+
+    let mut plan: ExecutionPlan = serde_json::from_slice(&plan_bytes).with_context(|| {
+        format!(
+            "failed to parse execution plan JSON from {}",
+            plan_path.display()
+        )
+    })?;
+
+    let has_external_signature = defaults.plan_signature_hex.is_some()
+        || defaults.plan_signature_pubkey.is_some();
+
+    if has_external_signature {
+        if plan.signature.is_some() {
+            bail!("plan already contains a signature; remove it before supplying external signature flags");
+        }
+        let signature_hex = defaults.plan_signature_hex.as_deref().ok_or_else(|| {
+            anyhow!("--plan-signature-hex is required when using external signatures")
+        })?;
+        let public_key_hex = defaults.plan_signature_pubkey.as_deref().ok_or_else(|| {
+            anyhow!("--plan-signature-pubkey is required when using external signatures")
+        })?;
+        attach_plan_signature_with_hex(&mut plan, signature_hex, public_key_hex)?;
+    }
+
+    let signature = plan
+        .signature
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| anyhow!("execution plan is missing 'signature' attestation"))?;
+
+    let allow_list = if config.network.allowed_signers.is_empty() {
+        None
+    } else {
+        Some(
+            SignerAllowList::from_hex_iter(
+                config.network.allowed_signers.iter().map(|s| s.as_str()),
+            )
+            .map_err(|err| anyhow!(err.to_string()))?,
+        )
+    };
+
+    let verifying_key = deploy_guardrails::verify_plan_signature(
+        &plan.generated_at,
+        &plan.network,
+        &plan.contract,
+        &plan.execution,
+        &plan.services,
+        &signature,
+        allow_list.as_ref(),
+    )
+    .map_err(|err| anyhow!(err.to_string()))?;
+
+    let verifying_hex = hex::encode(verifying_key.to_bytes());
+    info!("   Plan signature verified for signer {}", verifying_hex);
+
+    let effective_auth_token = defaults
+        .auth_token
+        .clone()
+        .or_else(|| config.network.auth_token.clone())
+        .or_else(|| {
+            std::env::var("OMNE_RPC_TOKEN")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            std::env::var("OMNE_AUTH_TOKEN")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        });
+
+    let submission = spinner("Submitting execution plan to network...");
+    match submit_execution_plan(&plan, config, effective_auth_token.as_deref()).await {
+        Ok(Some(receipt)) => {
+            submission.finish_with_message("✅ Execution plan submitted");
+            if let Some(address) = receipt.contract_address.as_deref() {
+                info!("   Contract Address: {}", address);
+                println!("   Contract Address: {}", address);
+            }
+            let receipt_path = plan_path.with_extension("receipt.json");
+            let receipt_bytes = serde_json::to_vec_pretty(&receipt)?;
+            fs::write(&receipt_path, receipt_bytes).await?;
+            info!("   Deployment receipt written to {}", receipt_path.display());
+        }
+        Ok(None) => {
+            submission.finish_with_message("✅ Execution plan submitted");
+            info!("   Deployment endpoint returned no additional data");
+        }
+        Err(err) => {
+            submission.finish_with_message("⚠️ Failed to submit execution plan");
+            warn!("Execution plan submission failed: {}", err);
+        }
+    }
+
+    Ok(())
+}
+
+async fn print_plan_digest(args: &DeployDigestArgs) -> Result<()> {
+    let plan_path_str = args
+        .plan
+        .as_deref()
+        .ok_or_else(|| anyhow!("plan path must be provided (pass --digest-plan)"))?;
+    let plan_path = PathBuf::from(plan_path_str);
+
+    let plan_bytes = fs::read(&plan_path)
+        .await
+        .with_context(|| format!("failed to read execution plan from {}", plan_path.display()))?;
+
+    let plan: ExecutionPlan = serde_json::from_slice(&plan_bytes).with_context(|| {
+        format!(
+            "failed to parse execution plan JSON from {}",
+            plan_path.display()
+        )
+    })?;
+
+    let digest = deploy_guardrails::canonical_plan_digest(
+        &plan.generated_at,
+        &plan.network,
+        &plan.contract,
+        &plan.execution,
+        &plan.services,
+    )
+    .map_err(|err| anyhow!(err.to_string()))?;
+
+    println!("{}", hex::encode(digest));
     Ok(())
 }
 
@@ -1648,6 +1929,7 @@ fn build_execution_plan(
     services: &[String],
     config: &Config,
     compiler_attachment: Option<CompilerAttachment>,
+    skip_preview: bool,
 ) -> Result<ExecutionPlan> {
     let exec_config = tier.build_execution_config(&method.contract, &method.function);
     validate_execution_guardrails(
@@ -1657,17 +1939,23 @@ fn build_execution_plan(
     )
     .map_err(|err| anyhow!(err.to_string()))?;
     let engine = create_engine(&tier)?;
-    let execution_preview = engine
-        .execute(module.bytes(), exec_config.clone())
-        .map_err(|err| anyhow!("contract execution preview failed: {}", err))?;
+    let (execution_preview, preview_summary) = if skip_preview {
+        (None, None)
+    } else {
+        let execution_preview = engine
+            .execute(module.bytes(), exec_config.clone())
+            .map_err(|err| anyhow!("contract execution preview failed: {}", err))?;
 
-    let preview_summary = ExecutionPreviewSummary {
-        execution_time_ms: execution_preview.execution_time.as_millis(),
-        gas_consumed: execution_preview.gas_consumed,
-        return_value: execution_preview.return_value.clone(),
-        deterministic_state: execution_preview.deterministic_state.clone(),
-        call_depth_used: execution_preview.call_depth_used,
-        storage_bytes_written: execution_preview.storage_bytes_written,
+        let preview_summary = ExecutionPreviewSummary {
+            execution_time_ms: execution_preview.execution_time.as_millis(),
+            gas_consumed: execution_preview.gas_consumed,
+            return_value: execution_preview.return_value.clone(),
+            deterministic_state: execution_preview.deterministic_state.clone(),
+            call_depth_used: execution_preview.call_depth_used,
+            storage_bytes_written: execution_preview.storage_bytes_written,
+        };
+
+        (Some(execution_preview), Some(preview_summary))
     };
 
     let metadata = module.metadata();
@@ -1760,8 +2048,8 @@ fn build_execution_plan(
         execution: PlanExecution {
             tier: tier.as_str().to_string(),
             config: exec_config,
-            preview: Some(execution_preview),
-            preview_summary: Some(preview_summary),
+            preview: execution_preview,
+            preview_summary,
         },
         services: services.to_vec(),
         signature: None,
@@ -1807,6 +2095,43 @@ fn attach_plan_signature_with_key(
         public_key_hex: hex::encode(verifying_key.to_bytes()),
         signature_hex: hex::encode(signature.to_bytes()),
     });
+
+    Ok(verifying_key.to_bytes())
+}
+
+fn attach_plan_signature_with_hex(
+    plan: &mut ExecutionPlan,
+    signature_hex: &str,
+    public_key_hex: &str,
+) -> Result<[u8; 32]> {
+    let signature_clean = signature_hex.trim().trim_start_matches("0x");
+    if signature_clean.len() != 128 || !signature_clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("plan signature must be 64 bytes (128 hex characters)");
+    }
+
+    let public_key_clean = public_key_hex.trim().trim_start_matches("0x");
+    if public_key_clean.len() != 64 || !public_key_clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("plan signature public key must be 32 bytes (64 hex characters)");
+    }
+
+    let plan_signature = PlanSignature {
+        algorithm: "ed25519".to_string(),
+        public_key_hex: public_key_clean.to_ascii_lowercase(),
+        signature_hex: signature_clean.to_ascii_lowercase(),
+    };
+
+    plan.signature = Some(plan_signature.clone());
+
+    let verifying_key = deploy_guardrails::verify_plan_signature(
+        &plan.generated_at,
+        &plan.network,
+        &plan.contract,
+        &plan.execution,
+        &plan.services,
+        &plan_signature,
+        None,
+    )
+    .map_err(|err| anyhow!("KMS plan signature verification failed: {err}"))?;
 
     Ok(verifying_key.to_bytes())
 }
@@ -2010,6 +2335,7 @@ mod tests {
             &[],
             &config,
             Some(compiler_attachment),
+            false,
         )
         .expect("plan build");
 
@@ -2062,6 +2388,7 @@ mod tests {
             &[],
             &config,
             Some(compiler_attachment),
+            false,
         )
         .expect("plan build");
 
@@ -2100,6 +2427,7 @@ mod tests {
             &[],
             &plan_config,
             Some(compiler_attachment),
+            false,
         )
         .expect("plan build");
 
@@ -2157,7 +2485,15 @@ mod tests {
         config.network.ws_endpoint = "ws://test".to_string();
         config.network.explorer_url = "http://test".to_string();
 
-        let plan = build_execution_plan(&module, method, DeployTier::Standard, &[], &config, None)
+        let plan = build_execution_plan(
+            &module,
+            method,
+            DeployTier::Standard,
+            &[],
+            &config,
+            None,
+            false,
+        )
             .expect("plan build");
 
         let response = submit_execution_plan(&plan, &config, None)
@@ -2179,7 +2515,15 @@ mod tests {
             .expect("method present");
 
         let mut config = Config::default();
-        let plan = build_execution_plan(&module, method, DeployTier::Standard, &[], &config, None)
+        let plan = build_execution_plan(
+            &module,
+            method,
+            DeployTier::Standard,
+            &[],
+            &config,
+            None,
+            false,
+        )
             .expect("plan build");
 
         let digest = hex::encode(compute_plan_digest(&plan).expect("digest"));
