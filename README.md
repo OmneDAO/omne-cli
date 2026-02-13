@@ -148,6 +148,8 @@ omne dev deploy --no-sign --contract ./contract.wasm --network devnet
 #### Plan Signing & Verification
 
 - `omne dev deploy` now signs every execution plan by default. Supply `--signing-key <path>` with a hex-encoded Ed25519 secret to use a managed key, or let the CLI mint an ephemeral key. Ephemeral secrets are stored beside the plan as `<plan>.signing-key` so operators can promote them into an allow-list.
+- For external KMS workflows, pass the detached signature and public key with `--plan-signature-hex <hex>` and `--plan-signature-pubkey <hex>`. The CLI verifies the signature locally before submission.
+- Use `--no-submit` to generate a plan without submitting, then run `omne dev deploy submit <plan>` to submit a pre-signed plan. `omne dev deploy digest <plan>` prints the canonical digest for offline signing.
 - `omne dev deploy verify <plan.json>` replays the canonical digest computation and checks the signature against the configured signer allow-list. Add extra approved keys inline with `--allowed-signer <hex>` or bypass enforcement with `--allow-unknown-signer` (not recommended for production).
 - `--no-sign` skips attaching a signature entirely—handy for local smoke tests, but hardened RPC endpoints will reject unsigned plans.
 - After a successful submission the CLI now checks the deployment metadata service (plan listings and nonce provenance) to confirm durable persistence. The canonical service list stored in the metadata layer is echoed back to the operator so discrepancies between the submitted plan and persisted record are easy to spot.
@@ -167,6 +169,9 @@ services = ["analytics", "orchestrator"]
 tier = "standard"
 signing_key = "./keys/deployment.ed25519"
 allow_unknown_services = false
+# Optional: provide an externally generated signature instead of signing_key
+# plan_signature_hex = "..."
+# plan_signature_pubkey = "..."
 ```
 
 - Override specific inputs at call-time, for example:
