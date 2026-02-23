@@ -154,6 +154,23 @@ omne dev deploy --no-sign --contract ./contract.wasm --network devnet
 - `--no-sign` skips attaching a signature entirely—handy for local smoke tests, but hardened RPC endpoints will reject unsigned plans.
 - After a successful submission the CLI now checks the deployment metadata service (plan listings and nonce provenance) to confirm durable persistence. The canonical service list stored in the metadata layer is echoed back to the operator so discrepancies between the submitted plan and persisted record are easy to spot.
 
+##### Identifier Normalization & Display
+
+- Contract deployments, plan receipts, and validator logs now standardize on the
+	same textual formats enforced by the chain: `contract_<40 hex>` for contracts,
+	`txn_<64 hex>` for transactions, and `omne1...` for wallet addresses.
+- `omne dev deploy` prints **both** the canonical `contract_`/`txn_` strings and
+	their legacy `0x...` equivalents so downstream scripts can be upgraded
+	incrementally.
+- Incoming arguments (template fields, CLI flags, JSON receipts) are normalised
+	by the CLI via `normalize_contract_address` and `normalize_transaction_id`,
+	so supplying bare hex or `0x` identifiers still works while everything stored
+	on disk (plans, receipts, metadata proofs) uses the canonical prefixes.
+- The TypeScript SDK mirrors this behaviour—`generateTransactionHash()` now
+	emits `txn_` identifiers and `isValidTransactionHash()` rejects the old `tx_`
+	form. Keep both toolchains up to date if you hash or validate deployments
+	outside the CLI.
+
 #### Deployment Templates
 
 - Use `--template <path>` to preload deployment inputs from TOML or YAML. CLI flags still override template values, while any missing field falls back to the active Omne configuration.
