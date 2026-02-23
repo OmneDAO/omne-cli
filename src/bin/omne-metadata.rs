@@ -8,12 +8,12 @@ use deploy_guardrails::metadata::{
 use ed25519_dalek::{Signer, SigningKey};
 use hex::FromHex;
 use serde::Serialize;
+use sha2::Digest;
 use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
-use sha2::Digest;
 use wasmparser::{Parser, Payload};
 
 #[derive(Debug, Serialize)]
@@ -56,7 +56,10 @@ fn main() -> Result<()> {
     let metadata = build_metadata(&wasm_path, &wasm_bytes, &methods)?;
     let signature = sign_metadata(&metadata, &key_path)?;
 
-    let envelope = MetadataEnvelope { metadata, signature };
+    let envelope = MetadataEnvelope {
+        metadata,
+        signature,
+    };
     let json = serde_json::to_string_pretty(&envelope)?;
     fs::write(&output_path, json)
         .with_context(|| format!("failed to write metadata to {}", output_path.display()))?;
@@ -156,7 +159,10 @@ fn build_metadata(
     })
 }
 
-fn sign_metadata(metadata: &CompilerMetadata, key_path: &Path) -> Result<CompilerMetadataSignature> {
+fn sign_metadata(
+    metadata: &CompilerMetadata,
+    key_path: &Path,
+) -> Result<CompilerMetadataSignature> {
     let raw_key = fs::read_to_string(key_path)
         .with_context(|| format!("failed to read signing key at {}", key_path.display()))?;
     let key_hex = raw_key.trim().trim_start_matches("0x");

@@ -5,15 +5,15 @@ use crate::utils::{confirm, spinner};
 use crate::wasm;
 use anyhow::{anyhow, bail, Context, Result};
 use axiom_runtime::{
-    AxiomEngine, ExecutionConfig as RuntimeExecutionConfig, ExecutionResult, COMPUTEVM_GAS_LIMIT,
-    COMPUTEVM_MAX_CALL_DEPTH, COMPUTEVM_STORAGE_BUDGET_BYTES, COMPUTEVM_TIMEOUT_US,
-    FASTVM_GAS_LIMIT, FASTVM_MAX_CALL_DEPTH, FASTVM_STORAGE_BUDGET_BYTES, FASTVM_TIMEOUT_US,
-    STANDARDVM_GAS_LIMIT, STANDARDVM_MAX_CALL_DEPTH, STANDARDVM_STORAGE_BUDGET_BYTES,
-    STANDARDVM_TIMEOUT_US,
+    execution::SerializableVal, AxiomEngine, ExecutionConfig as RuntimeExecutionConfig,
+    ExecutionResult, COMPUTEVM_GAS_LIMIT, COMPUTEVM_MAX_CALL_DEPTH, COMPUTEVM_STORAGE_BUDGET_BYTES,
+    COMPUTEVM_TIMEOUT_US, FASTVM_GAS_LIMIT, FASTVM_MAX_CALL_DEPTH, FASTVM_STORAGE_BUDGET_BYTES,
+    FASTVM_TIMEOUT_US, STANDARDVM_GAS_LIMIT, STANDARDVM_MAX_CALL_DEPTH,
+    STANDARDVM_STORAGE_BUDGET_BYTES, STANDARDVM_TIMEOUT_US,
 };
 use base64ct::{Base64, Encoding};
 use chrono::Utc;
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Subcommand, ValueEnum};
 use deploy_guardrails::{
     compiler_signers_vec_for_network, enforce_allowed_services, validate_execution_guardrails,
     verify_metadata_signature, CompilerMetadata, CompilerMetadataSignature, PlanSignatureData,
@@ -162,7 +162,7 @@ struct PlanExecution {
 struct ExecutionPreviewSummary {
     execution_time_ms: u128,
     gas_consumed: u64,
-    return_value: Option<axiom_runtime::execution::SerializableVal>,
+    return_value: Option<SerializableVal>,
     deterministic_state: String,
     call_depth_used: u32,
     storage_bytes_written: u64,
@@ -244,9 +244,17 @@ pub struct DeployPlanArgs {
     #[arg(long, value_enum)]
     pub tier: Option<DeployTier>,
 
+    /// Override the default gas limit inferred from the tier
+    #[arg(long)]
+    pub gas_limit: Option<u64>,
+
     /// Skip execution preview when generating a plan
     #[arg(long)]
     pub skip_preview: bool,
+
+    /// Raw function arguments provided as TYPE:VALUE (e.g. i32:42, i64:0xFF)
+    #[arg(long = "arg", value_name = "TYPE:VALUE", action = ArgAction::Append)]
+    pub arguments: Vec<String>,
 
     /// Path to Ed25519 signing key (hex-encoded) for execution plan attestation
     #[arg(long)]
@@ -281,7 +289,9 @@ impl Default for DeployPlanArgs {
             auth_token: None,
             allow_unknown_services: false,
             tier: None,
+            gas_limit: None,
             skip_preview: false,
+            arguments: Vec::new(),
             signing_key: None,
             no_sign: false,
             no_submit: false,
@@ -331,7 +341,7 @@ pub struct DeployVerifyArgs {
     pub allow_unknown_signer: bool,
 
     /// Additional signer public keys (hex) to permit during verification
-    #[arg(long = "allowed-signer", value_name = "HEX", action = clap::ArgAction::Append)]
+    #[arg(long = "allowed-signer", value_name = "HEX", action = ArgAction::Append)]
     pub allowed_signer: Vec<String>,
 }
 
@@ -343,10 +353,12 @@ struct DeployPlanTemplate {
     entry: Option<String>,
     plan: Option<String>,
     services: Vec<String>,
+    arguments: Vec<String>,
     network: Option<String>,
     auth_token: Option<String>,
     allow_unknown_services: Option<bool>,
     tier: Option<DeployTier>,
+    gas_limit: Option<u64>,
     skip_preview: Option<bool>,
     signing_key: Option<String>,
     no_sign: Option<bool>,
@@ -362,10 +374,12 @@ struct ResolvedDeployPlan {
     entry: Option<String>,
     plan_path: Option<String>,
     services: Vec<String>,
+    arguments: Vec<SerializableVal>,
     network: String,
     auth_token: Option<String>,
     allow_unknown_services: bool,
     tier: DeployTier,
+    gas_limit: Option<u64>,
     skip_preview: bool,
     signing_key: Option<String>,
     no_sign: bool,
@@ -457,11 +471,26 @@ async fn resolve_plan_args(args: &DeployPlanArgs, config: &Config) -> Result<Res
         .or_else(|| template.tier.clone())
         .unwrap_or(DeployTier::Standard);
 
+    let gas_limit = args
+        .gas_limit
+        .or(template.gas_limit)
+        .filter(|limit| *limit > 0);
+
     let skip_preview = if args.skip_preview {
         true
     } else {
         template.skip_preview.unwrap_or(false)
     };
+
+    let argument_specs = if !args.arguments.is_empty() {
+        args.arguments.clone()
+    } else if !template.arguments.is_empty() {
+        template.arguments.clone()
+    } else {
+        Vec::new()
+    };
+
+    let arguments = parse_argument_specs(&argument_specs)?;
 
     let signing_key = args
         .signing_key
@@ -496,10 +525,12 @@ async fn resolve_plan_args(args: &DeployPlanArgs, config: &Config) -> Result<Res
         entry,
         plan_path,
         services,
+        arguments,
         network,
         auth_token,
         allow_unknown_services,
         tier,
+        gas_limit,
         skip_preview,
         signing_key,
         no_sign,
@@ -509,6 +540,122 @@ async fn resolve_plan_args(args: &DeployPlanArgs, config: &Config) -> Result<Res
     })
 }
 
+fn parse_argument_specs(specs: &[String]) -> Result<Vec<SerializableVal>> {
+    let mut parsed = Vec::new();
+    for spec in specs {
+        let (raw_ty, raw_value) = spec
+            .split_once(':')
+            .ok_or_else(|| anyhow!("argument '{}' must be in TYPE:VALUE form", spec))?;
+        let ty = raw_ty.trim().to_ascii_lowercase();
+        let value = raw_value.trim();
+        let parsed_value = match ty.as_str() {
+            "i32" => SerializableVal::I32(parse_i32_value(value)?),
+            "u32" => {
+                let val = parse_unsigned_to_i128(value, 32)?;
+                if val > i32::MAX as i128 {
+                    bail!("value {} exceeds i32 range", value);
+                }
+                SerializableVal::I32(val as i32)
+            }
+            "i64" => SerializableVal::I64(parse_i64_value(value)?),
+            "u64" => {
+                let val = parse_unsigned_to_i128(value, 64)?;
+                if val > i64::MAX as i128 {
+                    bail!("value {} exceeds i64 range", value);
+                }
+                SerializableVal::I64(val as i64)
+            }
+            "f32" => SerializableVal::F32(
+                value
+                    .parse::<f32>()
+                    .map_err(|err| anyhow!("failed to parse f32 argument '{}': {}", value, err))?,
+            ),
+            "f64" => SerializableVal::F64(
+                value
+                    .parse::<f64>()
+                    .map_err(|err| anyhow!("failed to parse f64 argument '{}': {}", value, err))?,
+            ),
+            other => bail!(
+                "unsupported argument type '{}'; use i32, i64, u32, u64, f32, or f64",
+                other
+            ),
+        };
+        parsed.push(parsed_value);
+    }
+    Ok(parsed)
+}
+
+fn parse_i32_value(value: &str) -> Result<i32> {
+    let parsed = parse_signed_int(value, 32)?;
+    if parsed < i32::MIN as i128 || parsed > i32::MAX as i128 {
+        bail!("value {} exceeds i32 range", value);
+    }
+    Ok(parsed as i32)
+}
+
+fn parse_i64_value(value: &str) -> Result<i64> {
+    let parsed = parse_signed_int(value, 64)?;
+    if parsed < i64::MIN as i128 || parsed > i64::MAX as i128 {
+        bail!("value {} exceeds i64 range", value);
+    }
+    Ok(parsed as i64)
+}
+
+fn parse_unsigned_to_i128(value: &str, bits: u32) -> Result<i128> {
+    let trimmed = value.trim();
+    let cleaned = trimmed.trim_start_matches('+');
+    let digits = cleaned
+        .strip_prefix("0x")
+        .or_else(|| cleaned.strip_prefix("0X"))
+        .unwrap_or(cleaned);
+    let radix = if cleaned.starts_with("0x") || cleaned.starts_with("0X") {
+        16
+    } else {
+        10
+    };
+    let parsed = i128::from_str_radix(digits, radix).map_err(|err| {
+        anyhow!(
+            "failed to parse unsigned {}-bit integer '{}': {}",
+            bits,
+            value,
+            err
+        )
+    })?;
+    if parsed < 0 {
+        bail!("value {} must be non-negative", value);
+    }
+    let max = (1i128 << bits) - 1;
+    if parsed > max {
+        bail!("value {} exceeds u{} range", value, bits);
+    }
+    Ok(parsed)
+}
+
+fn parse_signed_int(value: &str, bits: u32) -> Result<i128> {
+    let trimmed = value.trim();
+    let negative = trimmed.starts_with('-');
+    let unsigned = trimmed.trim_start_matches(['+', '-']);
+    let (digits, radix) = if unsigned.starts_with("0x") || unsigned.starts_with("0X") {
+        (&unsigned[2..], 16)
+    } else {
+        (unsigned, 10)
+    };
+    let magnitude = i128::from_str_radix(digits, radix).map_err(|err| {
+        anyhow!(
+            "failed to parse signed {}-bit integer '{}': {}",
+            bits,
+            value,
+            err
+        )
+    })?;
+    let signed_value = if negative { -magnitude } else { magnitude };
+    let min = -(1i128 << (bits - 1));
+    let max = (1i128 << (bits - 1)) - 1;
+    if signed_value < min || signed_value > max {
+        bail!("value {} exceeds i{} range", value, bits);
+    }
+    Ok(signed_value)
+}
 #[derive(Subcommand)]
 pub enum DevCommands {
     /// Create new Omne project
@@ -712,6 +859,8 @@ async fn run_tests(
 
 async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
     let resolved = resolve_plan_args(args, config).await?;
+    let production_guardrails =
+        is_production_network(&config.network.name) || is_production_network(&resolved.network);
 
     if let Some(name) = resolved.template_name.as_deref() {
         info!("📝 Using deployment template: {}", name);
@@ -732,9 +881,7 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
     }
 
     if resolved.network == "mainnet" && resolved.skip_preview {
-        bail!(
-            "execution preview cannot be skipped on mainnet; remove skip_preview/--skip-preview"
-        );
+        bail!("execution preview cannot be skipped on mainnet; remove skip_preview/--skip-preview");
     }
 
     let effective_auth_token = resolved
@@ -769,9 +916,12 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
     if resolved.allow_unknown_services && !config.network.allowed_services.is_empty() {
         warn!("Bypassing service allow-list validation; proceed with caution.");
     } else if config.network.allowed_services.is_empty() && !service_selection.is_empty() {
-        warn!(
-            "No service allow-list configured for {}; unable to verify requested services.",
-            config.network.name
+        log_guardrail_notice(
+            production_guardrails,
+            format!(
+                "No service allow-list configured for {}; unable to verify requested services.",
+                config.network.name
+            ),
         );
     }
 
@@ -861,7 +1011,16 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
                 info!("   Legacy export retained as {}", legacy);
             }
         }
+        if !resolved.arguments.is_empty() {
+            info!(
+                "   Raw argument count supplied: {}",
+                resolved.arguments.len()
+            );
+        }
         info!("   Execution tier: {}", resolved.tier);
+        if let Some(limit) = resolved.gas_limit {
+            info!("   Gas limit override: {}", limit);
+        }
         if resolved.skip_preview {
             info!("   Execution preview skipped (--skip-preview)");
         }
@@ -906,9 +1065,11 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
             selected_method,
             resolved.tier.clone(),
             &service_selection,
+            &resolved.arguments,
             config,
             compiler_attachment.clone(),
             resolved.skip_preview,
+            resolved.gas_limit,
         )?;
 
         let mut plan_signer: Option<[u8; 32]> = None;
@@ -928,11 +1089,8 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
                 anyhow!("--plan-signature-pubkey is required when using external signatures")
             })?;
 
-            let verifying_key = attach_plan_signature_with_hex(
-                &mut execution_plan,
-                signature_hex,
-                public_key_hex,
-            )?;
+            let verifying_key =
+                attach_plan_signature_with_hex(&mut execution_plan, signature_hex, public_key_hex)?;
             let verifying_hex = hex::encode(verifying_key);
             info!(
                 "🔏 Execution plan signed with external key {}",
@@ -979,13 +1137,17 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
                 ) {
                     Ok(list) => {
                         if list.is_empty() {
-                            warn!(
-                                "No valid signer entries discovered in configuration allow-list; verification may fail."
+                            log_guardrail_notice(
+                                production_guardrails,
+                                "No valid signer entries discovered in configuration allow-list; verification may fail.",
                             );
                         } else if !list.contains_bytes(&verifying_key) {
-                            warn!(
-                                "Plan signer {} not present in configured allow-list; update configuration or rotate keys before mainnet promotion.",
-                                hex::encode(verifying_key)
+                            log_guardrail_notice(
+                                production_guardrails,
+                                format!(
+                                    "Plan signer {} not present in configured allow-list; update configuration or rotate keys before mainnet promotion.",
+                                    hex::encode(verifying_key)
+                                ),
                             );
                         } else {
                             info!(
@@ -995,9 +1157,12 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
                         }
                     }
                     Err(err) => {
-                        warn!(
-                            "Failed to parse signer allow-list from configuration: {}",
-                            err
+                        log_guardrail_notice(
+                            production_guardrails,
+                            format!(
+                                "Failed to parse signer allow-list from configuration: {}",
+                                err
+                            ),
                         );
                     }
                 }
@@ -1039,8 +1204,13 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
             Ok(Some(receipt)) => {
                 submission.finish_with_message("✅ Execution plan submitted");
                 if let Some(address) = receipt.contract_address.as_deref() {
-                    info!("   Contract Address: {}", address);
-                    println!("   Contract Address: {}", address);
+                    if let Some((omne_addr, hex_addr)) = normalize_contract_address(address) {
+                        info!("   Contract Address: {} (0x: {})", omne_addr, hex_addr);
+                        println!("   Contract Address: {} (0x: {})", omne_addr, hex_addr);
+                    } else {
+                        info!("   Contract Address: {}", address);
+                        println!("   Contract Address: {}", address);
+                    }
                 }
 
                 if let Some(deployment_nonce) = receipt.deployment_nonce.as_deref() {
@@ -1048,7 +1218,11 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
                 }
 
                 if let Some(transaction_id) = receipt.transaction_id.as_deref() {
-                    info!("   Transaction ID: {}", transaction_id);
+                    if let Some((omne_tx, hex_tx)) = normalize_transaction_id(transaction_id) {
+                        info!("   Transaction ID: {} (0x: {})", omne_tx, hex_tx);
+                    } else {
+                        info!("   Transaction ID: {}", transaction_id);
+                    }
                 }
 
                 if let Some(signature) = receipt.plan_signature.as_ref() {
@@ -1142,6 +1316,7 @@ async fn verify_execution_plan(
     defaults: &DeployPlanArgs,
     config: &Config,
 ) -> Result<()> {
+    let production_guardrails = is_production_network(&config.network.name);
     let plan_path_str = verify
         .plan
         .as_deref()
@@ -1180,8 +1355,9 @@ async fn verify_execution_plan(
     } else {
         match SignerAllowList::from_hex_iter(allow_entries.iter().map(|s| s.as_str())) {
             Ok(list) if list.is_empty() => {
-                warn!(
-                    "No signer allow-list entries configured; verification will trust any valid signature."
+                log_guardrail_notice(
+                    production_guardrails,
+                    "No signer allow-list entries configured; verification will trust any valid signature.",
                 );
                 None
             }
@@ -1249,8 +1425,8 @@ async fn submit_deployment_plan(
         )
     })?;
 
-    let has_external_signature = defaults.plan_signature_hex.is_some()
-        || defaults.plan_signature_pubkey.is_some();
+    let has_external_signature =
+        defaults.plan_signature_hex.is_some() || defaults.plan_signature_pubkey.is_some();
 
     if has_external_signature {
         if plan.signature.is_some() {
@@ -1316,13 +1492,21 @@ async fn submit_deployment_plan(
         Ok(Some(receipt)) => {
             submission.finish_with_message("✅ Execution plan submitted");
             if let Some(address) = receipt.contract_address.as_deref() {
-                info!("   Contract Address: {}", address);
-                println!("   Contract Address: {}", address);
+                if let Some((omne_addr, hex_addr)) = normalize_contract_address(address) {
+                    info!("   Contract Address: {} (0x: {})", omne_addr, hex_addr);
+                    println!("   Contract Address: {} (0x: {})", omne_addr, hex_addr);
+                } else {
+                    info!("   Contract Address: {}", address);
+                    println!("   Contract Address: {}", address);
+                }
             }
             let receipt_path = plan_path.with_extension("receipt.json");
             let receipt_bytes = serde_json::to_vec_pretty(&receipt)?;
             fs::write(&receipt_path, receipt_bytes).await?;
-            info!("   Deployment receipt written to {}", receipt_path.display());
+            info!(
+                "   Deployment receipt written to {}",
+                receipt_path.display()
+            );
         }
         Ok(None) => {
             submission.finish_with_message("✅ Execution plan submitted");
@@ -1927,11 +2111,19 @@ fn build_execution_plan(
     method: &wasm::ContractMethod,
     tier: DeployTier,
     services: &[String],
+    arguments: &[SerializableVal],
     config: &Config,
     compiler_attachment: Option<CompilerAttachment>,
     skip_preview: bool,
+    gas_limit_override: Option<u64>,
 ) -> Result<ExecutionPlan> {
-    let exec_config = tier.build_execution_config(&method.contract, &method.function);
+    let mut exec_config = tier.build_execution_config(&method.contract, &method.function);
+    if let Some(limit) = gas_limit_override {
+        exec_config.gas_limit = limit;
+    }
+    if !arguments.is_empty() {
+        exec_config.arguments = arguments.to_vec();
+    }
     validate_execution_guardrails(
         tier.as_str(),
         exec_config.max_call_depth,
@@ -2219,6 +2411,61 @@ struct JsonRpcError {
     data: Option<JsonValue>,
 }
 
+fn normalize_contract_address(raw: &str) -> Option<(String, String)> {
+    normalize_hex_identifier(
+        raw,
+        &["contract_"],
+        40,
+        "contract_",
+    )
+}
+
+fn normalize_transaction_id(raw: &str) -> Option<(String, String)> {
+    normalize_hex_identifier(raw, &["txn_"], 64, "txn_")
+}
+
+fn normalize_hex_identifier(
+    raw: &str,
+    accepted_prefixes: &[&str],
+    expected_len: usize,
+    canonical_prefix: &str,
+) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+
+    let payload = accepted_prefixes
+        .iter()
+        .filter_map(|prefix| trimmed.strip_prefix(prefix))
+        .next()
+        .or_else(|| trimmed.strip_prefix("0x"))
+        .or_else(|| if trimmed.len() == expected_len { Some(trimmed) } else { None })?;
+
+    if payload.len() != expected_len {
+        return None;
+    }
+    if !payload.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let normalized = payload.to_ascii_lowercase();
+    Some((
+        format!("{}{}", canonical_prefix, normalized),
+        format!("0x{}", normalized),
+    ))
+}
+
+fn log_guardrail_notice(enforce_warning: bool, message: impl Into<String>) {
+    let rendered = message.into();
+    if enforce_warning {
+        warn!("{}", rendered);
+    } else {
+        info!("{}", rendered);
+    }
+}
+
+fn is_production_network(name: &str) -> bool {
+    matches!(name, "mainnet" | "omne_mainnet")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2333,9 +2580,11 @@ mod tests {
             method,
             DeployTier::Standard,
             &[],
+            &[],
             &config,
             Some(compiler_attachment),
             false,
+            None,
         )
         .expect("plan build");
 
@@ -2386,9 +2635,11 @@ mod tests {
             method,
             DeployTier::Standard,
             &[],
+            &[],
             &config,
             Some(compiler_attachment),
             false,
+            None,
         )
         .expect("plan build");
 
@@ -2425,9 +2676,11 @@ mod tests {
             method,
             DeployTier::Standard,
             &[],
+            &[],
             &plan_config,
             Some(compiler_attachment),
             false,
+            None,
         )
         .expect("plan build");
 
@@ -2475,7 +2728,7 @@ mod tests {
             ])
             .respond_with(json_encoded(json!({
                 "jsonrpc": "2.0",
-                "result": { "contractAddress": "omne1deadbeef" },
+                "result": { "contractAddress": "contract_deadbeef" },
                 "id": 1
             }))),
         );
@@ -2490,18 +2743,20 @@ mod tests {
             method,
             DeployTier::Standard,
             &[],
+            &[],
             &config,
             None,
             false,
+            None,
         )
-            .expect("plan build");
+        .expect("plan build");
 
         let response = submit_execution_plan(&plan, &config, None)
             .await
             .expect("submission succeeds");
 
         let receipt = response.expect("deployment result");
-        assert_eq!(receipt.contract_address.as_deref(), Some("omne1deadbeef"));
+        assert_eq!(receipt.contract_address.as_deref(), Some("contract_deadbeef"));
 
         server.verify_and_clear();
     }
@@ -2520,11 +2775,13 @@ mod tests {
             method,
             DeployTier::Standard,
             &[],
+            &[],
             &config,
             None,
             false,
+            None,
         )
-            .expect("plan build");
+        .expect("plan build");
 
         let digest = hex::encode(compute_plan_digest(&plan).expect("digest"));
         let plan_id_prefix = format!("pln_{}", &digest[..12.min(digest.len())]);
