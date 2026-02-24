@@ -152,6 +152,10 @@ struct PlanEntry {
 struct PlanExecution {
     tier: String,
     config: RuntimeExecutionConfig,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    typed_arguments: Vec<TypedArgument>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_base64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     preview: Option<ExecutionResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -374,7 +378,9 @@ struct ResolvedDeployPlan {
     entry: Option<String>,
     plan_path: Option<String>,
     services: Vec<String>,
-    arguments: Vec<SerializableVal>,
+    numeric_arguments: Vec<SerializableVal>,
+    typed_arguments: Vec<TypedArgument>,
+    input_base64: Option<String>,
     network: String,
     auth_token: Option<String>,
     allow_unknown_services: bool,
@@ -490,7 +496,11 @@ async fn resolve_plan_args(args: &DeployPlanArgs, config: &Config) -> Result<Res
         Vec::new()
     };
 
-    let arguments = parse_argument_specs(&argument_specs)?;
+    let ParsedArguments {
+        numeric,
+        typed,
+        input_base64,
+    } = parse_typed_argument_specs(&argument_specs)?;
 
     let signing_key = args
         .signing_key
@@ -525,7 +535,9 @@ async fn resolve_plan_args(args: &DeployPlanArgs, config: &Config) -> Result<Res
         entry,
         plan_path,
         services,
-        arguments,
+        numeric_arguments: numeric,
+        typed_arguments: typed,
+        input_base64,
         network,
         auth_token,
         allow_unknown_services,
@@ -540,49 +552,126 @@ async fn resolve_plan_args(args: &DeployPlanArgs, config: &Config) -> Result<Res
     })
 }
 
-fn parse_argument_specs(specs: &[String]) -> Result<Vec<SerializableVal>> {
-    let mut parsed = Vec::new();
+fn parse_typed_argument_specs(specs: &[String]) -> Result<ParsedArguments> {
+    let mut numeric: Vec<SerializableVal> = Vec::new();
+    let mut typed: Vec<TypedArgument> = Vec::new();
+    let mut input_blob: Option<Vec<u8>> = None;
+
     for spec in specs {
         let (raw_ty, raw_value) = spec
             .split_once(':')
             .ok_or_else(|| anyhow!("argument '{}' must be in TYPE:VALUE form", spec))?;
         let ty = raw_ty.trim().to_ascii_lowercase();
         let value = raw_value.trim();
-        let parsed_value = match ty.as_str() {
-            "i32" => SerializableVal::I32(parse_i32_value(value)?),
+
+        match ty.as_str() {
+            "i32" => {
+                let v = parse_i32_value(value)?;
+                numeric.push(SerializableVal::I32(v));
+                typed.push(TypedArgument::I32(v));
+            }
             "u32" => {
                 let val = parse_unsigned_to_i128(value, 32)?;
                 if val > i32::MAX as i128 {
                     bail!("value {} exceeds i32 range", value);
                 }
-                SerializableVal::I32(val as i32)
+                numeric.push(SerializableVal::I32(val as i32));
+                typed.push(TypedArgument::U32(val as u32));
             }
-            "i64" => SerializableVal::I64(parse_i64_value(value)?),
+            "i64" => {
+                let v = parse_i64_value(value)?;
+                numeric.push(SerializableVal::I64(v));
+                typed.push(TypedArgument::I64(v));
+            }
             "u64" => {
                 let val = parse_unsigned_to_i128(value, 64)?;
                 if val > i64::MAX as i128 {
                     bail!("value {} exceeds i64 range", value);
                 }
-                SerializableVal::I64(val as i64)
+                numeric.push(SerializableVal::I64(val as i64));
+                typed.push(TypedArgument::U64(val as u64));
             }
-            "f32" => SerializableVal::F32(
-                value
-                    .parse::<f32>()
-                    .map_err(|err| anyhow!("failed to parse f32 argument '{}': {}", value, err))?,
-            ),
-            "f64" => SerializableVal::F64(
-                value
-                    .parse::<f64>()
-                    .map_err(|err| anyhow!("failed to parse f64 argument '{}': {}", value, err))?,
-            ),
+            "f32" => {
+                let parsed = value.parse::<f32>().map_err(|err| {
+                    anyhow!("failed to parse f32 argument '{}': {}", value, err)
+                })?;
+                numeric.push(SerializableVal::F32(parsed));
+                typed.push(TypedArgument::F32(parsed));
+            }
+            "f64" => {
+                let parsed = value.parse::<f64>().map_err(|err| {
+                    anyhow!("failed to parse f64 argument '{}': {}", value, err)
+                })?;
+                numeric.push(SerializableVal::F64(parsed));
+                typed.push(TypedArgument::F64(parsed));
+            }
+            "bool" => {
+                let parsed = match value.to_ascii_lowercase().as_str() {
+                    "true" | "1" => true,
+                    "false" | "0" => false,
+                    _ => bail!("bool argument '{}' must be true/false/1/0", value),
+                };
+                numeric.push(SerializableVal::I32(if parsed { 1 } else { 0 }));
+                typed.push(TypedArgument::Bool(parsed));
+            }
+            "string" => {
+                let bytes = value.as_bytes().to_vec();
+                typed.push(TypedArgument::String(value.to_string()));
+                input_blob = Some(merge_input_blob(input_blob, bytes));
+            }
+            "bytes" => {
+                let decoded = Base64::decode_vec(value).or_else(|_| hex::decode(value))
+                    .map_err(|err| anyhow!("failed to decode bytes argument: {}", err))?;
+                typed.push(TypedArgument::BytesBase64(Base64::encode_string(&decoded)));
+                input_blob = Some(merge_input_blob(input_blob, decoded));
+            }
+            "bytes-hex" => {
+                let decoded = hex::decode(value.trim_start_matches("0x")).map_err(|err| {
+                    anyhow!("failed to decode bytes-hex argument: {}", err)
+                })?;
+                typed.push(TypedArgument::BytesBase64(Base64::encode_string(&decoded)));
+                input_blob = Some(merge_input_blob(input_blob, decoded));
+            }
             other => bail!(
-                "unsupported argument type '{}'; use i32, i64, u32, u64, f32, or f64",
+                "unsupported argument type '{}'; use i32, i64, u32, u64, f32, f64, bool, string, bytes, or bytes-hex",
                 other
             ),
-        };
-        parsed.push(parsed_value);
+        }
     }
-    Ok(parsed)
+
+    let input_base64 = input_blob.map(|blob| Base64::encode_string(&blob));
+
+    Ok(ParsedArguments {
+        numeric,
+        typed,
+        input_base64,
+    })
+}
+
+fn merge_input_blob(current: Option<Vec<u8>>, mut next: Vec<u8>) -> Vec<u8> {
+    let mut out = current.unwrap_or_default();
+    out.append(&mut next);
+    out
+}
+
+struct ParsedArguments {
+    numeric: Vec<SerializableVal>,
+    typed: Vec<TypedArgument>,
+    input_base64: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "lowercase")]
+enum TypedArgument {
+    I32(i32),
+    U32(u32),
+    I64(i64),
+    U64(u64),
+    F32(f32),
+    F64(f64),
+    Bool(bool),
+    String(String),
+    BytesBase64(String),
 }
 
 fn parse_i32_value(value: &str) -> Result<i32> {
@@ -1011,10 +1100,18 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
                 info!("   Legacy export retained as {}", legacy);
             }
         }
-        if !resolved.arguments.is_empty() {
+        if !resolved.typed_arguments.is_empty() {
             info!(
-                "   Raw argument count supplied: {}",
-                resolved.arguments.len()
+                "   Raw argument count supplied: {} (typed args enabled)",
+                resolved.typed_arguments.len()
+            );
+        }
+        if let Some(input_b64) = resolved.input_base64.as_ref() {
+            info!(
+                "   Input payload detected ({} bytes)",
+                Base64::decode_vec(input_b64)
+                    .map(|b| b.len())
+                    .unwrap_or_default()
             );
         }
         info!("   Execution tier: {}", resolved.tier);
@@ -1065,7 +1162,9 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
             selected_method,
             resolved.tier.clone(),
             &service_selection,
-            &resolved.arguments,
+            &resolved.numeric_arguments,
+            &resolved.typed_arguments,
+            resolved.input_base64.clone(),
             config,
             compiler_attachment.clone(),
             resolved.skip_preview,
@@ -2111,7 +2210,9 @@ fn build_execution_plan(
     method: &wasm::ContractMethod,
     tier: DeployTier,
     services: &[String],
-    arguments: &[SerializableVal],
+    numeric_arguments: &[SerializableVal],
+    typed_arguments: &[TypedArgument],
+    input_base64: Option<String>,
     config: &Config,
     compiler_attachment: Option<CompilerAttachment>,
     skip_preview: bool,
@@ -2121,8 +2222,8 @@ fn build_execution_plan(
     if let Some(limit) = gas_limit_override {
         exec_config.gas_limit = limit;
     }
-    if !arguments.is_empty() {
-        exec_config.arguments = arguments.to_vec();
+    if !numeric_arguments.is_empty() {
+        exec_config.arguments = numeric_arguments.to_vec();
     }
     validate_execution_guardrails(
         tier.as_str(),
@@ -2131,7 +2232,19 @@ fn build_execution_plan(
     )
     .map_err(|err| anyhow!(err.to_string()))?;
     let engine = create_engine(&tier)?;
-    let (execution_preview, preview_summary) = if skip_preview {
+    let typed_requires_memory = typed_arguments
+        .iter()
+        .any(|arg| matches!(arg, TypedArgument::String(_) | TypedArgument::BytesBase64(_)));
+
+    let should_skip_preview = skip_preview || typed_requires_memory;
+
+    if typed_requires_memory && !skip_preview {
+        warn!(
+            "Skipping execution preview: string/bytes arguments require runtime injection"
+        );
+    }
+
+    let (execution_preview, preview_summary) = if should_skip_preview {
         (None, None)
     } else {
         let execution_preview = engine
@@ -2240,6 +2353,8 @@ fn build_execution_plan(
         execution: PlanExecution {
             tier: tier.as_str().to_string(),
             config: exec_config,
+            typed_arguments: typed_arguments.to_vec(),
+            input_base64,
             preview: execution_preview,
             preview_summary,
         },
@@ -2581,6 +2696,10 @@ mod tests {
             DeployTier::Standard,
             &[],
             &[],
+            &[],
+            &[],
+            None,
+            None,
             &config,
             Some(compiler_attachment),
             false,
@@ -2677,6 +2796,8 @@ mod tests {
             DeployTier::Standard,
             &[],
             &[],
+            &[],
+            None,
             &plan_config,
             Some(compiler_attachment),
             false,
@@ -2744,6 +2865,8 @@ mod tests {
             DeployTier::Standard,
             &[],
             &[],
+            &[],
+            None,
             &config,
             None,
             false,
@@ -2776,6 +2899,8 @@ mod tests {
             DeployTier::Standard,
             &[],
             &[],
+            &[],
+            None,
             &config,
             None,
             false,
