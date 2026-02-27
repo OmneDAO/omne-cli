@@ -619,6 +619,24 @@ fn parse_typed_argument_specs(specs: &[String]) -> Result<ParsedArguments> {
                 typed.push(TypedArgument::String(value.to_string()));
                 input_blob = Some(merge_input_blob(input_blob, bytes));
             }
+            "option<string>" => {
+                let trimmed = value.trim();
+                if trimmed.eq_ignore_ascii_case("none") {
+                    typed.push(TypedArgument::OptionString(None));
+                } else {
+                    let inner = if let Some(rest) = trimmed.strip_prefix("some:") {
+                        rest
+                    } else {
+                        trimmed
+                    };
+                    if inner.is_empty() {
+                        bail!("option<string> some:<value> must include a value");
+                    }
+                    let bytes = inner.as_bytes().to_vec();
+                    typed.push(TypedArgument::OptionString(Some(inner.to_string())));
+                    input_blob = Some(merge_input_blob(input_blob, bytes));
+                }
+            }
             "bytes" => {
                 let decoded = Base64::decode_vec(value).or_else(|_| hex::decode(value))
                     .map_err(|err| anyhow!("failed to decode bytes argument: {}", err))?;
@@ -633,7 +651,7 @@ fn parse_typed_argument_specs(specs: &[String]) -> Result<ParsedArguments> {
                 input_blob = Some(merge_input_blob(input_blob, decoded));
             }
             other => bail!(
-                "unsupported argument type '{}'; use i32, i64, u32, u64, f32, f64, bool, string, bytes, or bytes-hex",
+                "unsupported argument type '{}'; use i32, i64, u32, u64, f32, f64, bool, string, option<string>, bytes, or bytes-hex",
                 other
             ),
         }
@@ -672,6 +690,7 @@ enum TypedArgument {
     Bool(bool),
     String(String),
     BytesBase64(String),
+    OptionString(Option<String>),
 }
 
 fn parse_i32_value(value: &str) -> Result<i32> {
@@ -2205,6 +2224,7 @@ fn hash_nonce(nonce: &str) -> String {
     hex::encode(digest)
 }
 
+
 fn build_execution_plan(
     module: &wasm::ContractModule,
     method: &wasm::ContractMethod,
@@ -2222,7 +2242,14 @@ fn build_execution_plan(
     if let Some(limit) = gas_limit_override {
         exec_config.gas_limit = limit;
     }
-    if !numeric_arguments.is_empty() {
+
+    // Default to preserving typed arguments so runtimes can materialize pointer/length
+    // pairs server-side. Only fall back to numeric arguments when no typed payload is
+    // provided.
+    let plan_typed_arguments = typed_arguments.to_vec();
+    let plan_input_base64 = input_base64.clone();
+
+    if typed_arguments.is_empty() && !numeric_arguments.is_empty() {
         exec_config.arguments = numeric_arguments.to_vec();
     }
     validate_execution_guardrails(
@@ -2234,7 +2261,14 @@ fn build_execution_plan(
     let engine = create_engine(&tier)?;
     let typed_requires_memory = typed_arguments
         .iter()
-        .any(|arg| matches!(arg, TypedArgument::String(_) | TypedArgument::BytesBase64(_)));
+        .any(|arg| {
+            matches!(
+                arg,
+                TypedArgument::String(_)
+                    | TypedArgument::BytesBase64(_)
+                    | TypedArgument::OptionString(Some(_))
+            )
+        });
 
     let should_skip_preview = skip_preview || typed_requires_memory;
 
@@ -2353,8 +2387,8 @@ fn build_execution_plan(
         execution: PlanExecution {
             tier: tier.as_str().to_string(),
             config: exec_config,
-            typed_arguments: typed_arguments.to_vec(),
-            input_base64,
+            typed_arguments: plan_typed_arguments,
+            input_base64: plan_input_base64,
             preview: execution_preview,
             preview_summary,
         },
