@@ -206,6 +206,15 @@ pub fn rpc_get(client: &Client, endpoint: &str, config: &Config) -> RequestBuild
 pub fn apply_rpc_headers(builder: RequestBuilder, config: &Config) -> RequestBuilder {
     let builder = builder.header("X-Omne-Nonce", generate_rpc_nonce());
 
+    // Devnet should be open for development; skip auth header when no token is configured.
+    if config.network.name.eq_ignore_ascii_case("devnet") {
+        if let Some(token) = cached_rpc_token(config) {
+            return builder.header(AUTHORIZATION, token);
+        }
+        // No warning for devnet: unauthenticated RPC is expected in local setups.
+        return builder;
+    }
+
     if let Some(token) = cached_rpc_token(config) {
         builder.header(AUTHORIZATION, token)
     } else {
