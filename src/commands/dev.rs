@@ -120,6 +120,8 @@ struct PlanContractMetadata {
     has_legacy_entry_main: bool,
     methods: Vec<wasm::ContractMethod>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    abi_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     compiler: Option<CompilerAttachment>,
 }
 
@@ -1709,6 +1711,9 @@ async fn verify_execution_plan(
         )
     })?;
 
+    validate_plan_metadata(&plan)?;
+    enforce_address_argument_hygiene(&plan.execution.typed_arguments)?;
+
     let signature = plan
         .signature
         .as_ref()
@@ -1795,6 +1800,9 @@ async fn submit_deployment_plan(
             err
         )
     })?;
+
+    validate_plan_metadata(&plan)?;
+    enforce_address_argument_hygiene(&plan.execution.typed_arguments)?;
 
     let has_external_signature =
         defaults.plan_signature_hex.is_some() || defaults.plan_signature_pubkey.is_some();
@@ -2635,6 +2643,11 @@ fn build_execution_plan(
 
     let metadata = module.metadata();
 
+    // Fail fast if callers try to sneak raw hex addresses as strings instead of Address20.
+    enforce_address_argument_hygiene(&plan_typed_arguments)?;
+
+    let abi_sha256 = compute_abi_checksum(metadata.contract_methods())?;
+
     let wasm_base64 = Base64::encode_string(module.bytes());
     let wasm_sha256 = format!("{:x}", Sha256::digest(module.bytes()));
 
@@ -2717,6 +2730,7 @@ fn build_execution_plan(
                 has_axiom_entry_main: metadata.has_runtime_entry(),
                 has_legacy_entry_main: metadata.has_legacy_entry(),
                 methods: metadata.contract_methods().to_vec(),
+                abi_sha256: Some(abi_sha256),
                 compiler: compiler_attachment,
             }),
         },
@@ -2822,6 +2836,68 @@ fn compute_plan_digest(plan: &ExecutionPlan) -> Result<[u8; 32]> {
         &plan.services,
     )
     .map_err(|err| anyhow!(err.to_string()))
+}
+
+fn compute_abi_checksum(methods: &[wasm::ContractMethod]) -> Result<String> {
+    let mut methods_sorted = methods.to_vec();
+    methods_sorted.sort_by(|a, b| {
+        a.contract
+            .cmp(&b.contract)
+            .then_with(|| a.function.cmp(&b.function))
+            .then_with(|| a.export.cmp(&b.export))
+    });
+    let json = serde_json::to_vec(&methods_sorted)?;
+    Ok(format!("{:x}", Sha256::digest(&json)))
+}
+
+fn validate_plan_metadata(plan: &ExecutionPlan) -> Result<()> {
+    let metadata = plan
+        .contract
+        .metadata
+        .as_ref()
+        .ok_or_else(|| anyhow!("execution plan is missing contract metadata; regenerate the plan"))?;
+
+    if metadata.methods.is_empty() {
+        bail!("execution plan metadata has no contract methods; regenerate with an updated compiler");
+    }
+
+    let recorded = metadata
+        .abi_sha256
+        .as_deref()
+        .ok_or_else(|| anyhow!("execution plan is missing ABI checksum; regenerate the plan"))?;
+    let computed = compute_abi_checksum(&metadata.methods)?;
+    if recorded != computed {
+        bail!("execution plan ABI checksum mismatch; regenerate the plan to refresh metadata");
+    }
+
+    Ok(())
+}
+
+fn looks_like_hex_address(value: &str) -> bool {
+    let trimmed = value.trim();
+    let clean = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    clean.len() == 40 && clean.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn enforce_address_argument_hygiene(args: &[TypedArgument]) -> Result<()> {
+    for arg in args {
+        match arg {
+            TypedArgument::String(s) if looks_like_hex_address(s) => {
+                bail!(
+                    "argument '{}' looks like a hex address; encode it as Address20 to enforce checksumming",
+                    s
+                );
+            }
+            TypedArgument::OptionString(Some(s)) if looks_like_hex_address(s) => {
+                bail!(
+                    "optional argument '{}' looks like a hex address; encode it as OptionAddress20 to enforce checksumming",
+                    s
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
