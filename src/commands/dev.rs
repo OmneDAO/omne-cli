@@ -722,17 +722,7 @@ fn parse_typed_argument_specs(specs: &[String]) -> Result<ParsedArguments> {
 }
 
 fn parse_caller_address(raw: &str) -> Result<[u8; 20]> {
-    let trimmed = raw.trim();
-    let clean = trimmed.strip_prefix("0x").unwrap_or(trimmed);
-    if clean.len() != 40 {
-        bail!("caller_address must be 20 bytes (40 hex chars)");
-    }
-
-    let bytes = hex::decode(clean)
-        .map_err(|_| anyhow!("caller_address must be hex (got: {})", raw))?;
-    let mut out = [0u8; 20];
-    out.copy_from_slice(&bytes[..20]);
-    Ok(out)
+    Ok(parse_address20(raw)?.0)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -743,7 +733,7 @@ impl Serialize for Address20 {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&format!("0x{}", hex::encode(self.0)))
+        serializer.serialize_str(&format!("omne1{}", hex::encode(self.0)))
     }
 }
 
@@ -759,16 +749,26 @@ impl<'de> Deserialize<'de> for Address20 {
 
 fn parse_address20(raw: &str) -> Result<Address20> {
     let trimmed = raw.trim();
-    let clean = trimmed.strip_prefix("0x").unwrap_or(trimmed);
-    if clean.len() != 40 {
-        bail!("address must be 20 bytes (40 hex chars)");
+    let payload = if let Some(rest) = trimmed.strip_prefix("omne1") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("0x") {
+        rest
+    } else {
+        trimmed
+    };
+
+    if payload.len() != 40 {
+        bail!("address must encode 20 bytes (found {} hex chars)", payload.len());
     }
-    if clean.chars().any(|c| c.is_ascii_uppercase()) {
+    if payload.chars().any(|c| c.is_ascii_uppercase()) {
         bail!("address hex must be lowercase");
+    }
+    if !payload.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("address must be valid lowercase hex (got: {})", raw);
     }
 
     let mut out = [0u8; 20];
-    hex::decode_to_slice(clean, &mut out)
+    hex::decode_to_slice(payload, &mut out)
         .map_err(|_| anyhow!("address must be valid lowercase hex (got: {})", raw))?;
     Ok(Address20(out))
 }
@@ -1220,6 +1220,8 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
     let resolved = resolve_plan_args(args, config).await?;
     let production_guardrails =
         is_production_network(&config.network.name) || is_production_network(&resolved.network);
+
+    require_fee_routing_config(&resolved.network, &config.network)?;
 
     if let Some(name) = resolved.template_name.as_deref() {
         info!("📝 Using deployment template: {}", name);
@@ -1711,6 +1713,13 @@ async fn verify_execution_plan(
         )
     })?;
 
+    let network_name = plan
+        .network
+        .as_ref()
+        .map(|n| n.name.as_str())
+        .unwrap_or_else(|| config.network.name.as_str());
+    require_fee_routing_config(network_name, &config.network)?;
+
     validate_plan_metadata(&plan)?;
     enforce_address_argument_hygiene(&plan.execution.typed_arguments)?;
 
@@ -1800,6 +1809,13 @@ async fn submit_deployment_plan(
             err
         )
     })?;
+
+    let network_name = plan
+        .network
+        .as_ref()
+        .map(|n| n.name.as_str())
+        .unwrap_or_else(|| config.network.name.as_str());
+    require_fee_routing_config(network_name, &config.network)?;
 
     validate_plan_metadata(&plan)?;
     enforce_address_argument_hygiene(&plan.execution.typed_arguments)?;
@@ -2875,7 +2891,10 @@ fn validate_plan_metadata(plan: &ExecutionPlan) -> Result<()> {
 
 fn looks_like_hex_address(value: &str) -> bool {
     let trimmed = value.trim();
-    let clean = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    let clean = trimmed
+        .strip_prefix("omne1")
+        .or_else(|| trimmed.strip_prefix("0x"))
+        .unwrap_or(trimmed);
     clean.len() == 40 && clean.chars().all(|c| c.is_ascii_hexdigit())
 }
 
@@ -3023,8 +3042,71 @@ fn log_guardrail_notice(enforce_warning: bool, message: impl Into<String>) {
     }
 }
 
+fn is_dev_network(name: &str) -> bool {
+    matches!(name, "devnet" | "omne_devnet")
+}
+
 fn is_production_network(name: &str) -> bool {
     matches!(name, "mainnet" | "omne_mainnet")
+}
+
+fn require_fee_routing_config(
+    network_name: &str,
+    network_config: &crate::config::NetworkConfig,
+) -> Result<()> {
+    if is_dev_network(network_name) {
+        return Ok(());
+    }
+
+    let treasury = network_config
+        .fee_treasury_address
+        .as_deref()
+        .ok_or_else(|| anyhow!("fee_treasury_address must be configured for {}", network_name))?;
+    let slash = network_config
+        .slash_sink_address
+        .as_deref()
+        .ok_or_else(|| anyhow!("slash_sink_address must be configured for {}", network_name))?;
+    let fee_vault = network_config
+        .fee_vault_address
+        .as_deref()
+        .ok_or_else(|| anyhow!("fee_vault_address must be configured for {}", network_name))?;
+    let validator_pool = network_config
+        .validator_fee_pool_address
+        .as_deref()
+        .ok_or_else(|| anyhow!("validator_fee_pool_address must be configured for {}", network_name))?;
+
+    let parsed_treasury = parse_address20(treasury)?;
+    let parsed_slash = parse_address20(slash)?;
+    let parsed_vault = parse_address20(fee_vault)?;
+    let parsed_validator_pool = parse_address20(validator_pool)?;
+
+    if parsed_treasury.0.iter().all(|b| *b == 0) {
+        bail!("fee_treasury_address cannot be all zeroes for {}", network_name);
+    }
+    if parsed_slash.0.iter().all(|b| *b == 0) {
+        bail!("slash_sink_address cannot be all zeroes for {}", network_name);
+    }
+    if parsed_vault.0.iter().all(|b| *b == 0) {
+        bail!("fee_vault_address cannot be all zeroes for {}", network_name);
+    }
+    if parsed_validator_pool.0.iter().all(|b| *b == 0) {
+        bail!(
+            "validator_fee_pool_address cannot be all zeroes for {}",
+            network_name
+        );
+    }
+
+    let fee_split = network_config.fee_split_bps.unwrap_or(0);
+    let povc_split = network_config.povc_split_bps.unwrap_or(0);
+
+    if fee_split > 10_000 {
+        bail!("fee_split_bps must be between 0 and 10000 (got {})", fee_split);
+    }
+    if povc_split > 10_000 {
+        bail!("povc_split_bps must be between 0 and 10000 (got {})", povc_split);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3237,6 +3319,14 @@ mod tests {
         let (compiler_attachment, compiler_signer) = make_signed_compiler_attachment(&module);
         let mut plan_config = Config::default();
         plan_config.network.allowed_compiler_signers = vec![compiler_signer.clone()];
+        let fee_treasury = "0x1111111111111111111111111111111111111111".to_string();
+        let slash_sink = "0x2222222222222222222222222222222222222222".to_string();
+        let fee_vault = "0x3333333333333333333333333333333333333333".to_string();
+        let validator_fee_pool = "0x4444444444444444444444444444444444444444".to_string();
+        plan_config.network.fee_treasury_address = Some(fee_treasury.clone());
+        plan_config.network.slash_sink_address = Some(slash_sink.clone());
+        plan_config.network.fee_vault_address = Some(fee_vault.clone());
+        plan_config.network.validator_fee_pool_address = Some(validator_fee_pool.clone());
 
         let mut plan = build_execution_plan(
             &module,
@@ -3266,6 +3356,10 @@ mod tests {
         let mut config = Config::default();
         config.network.allowed_signers = vec![hex::encode(verifying_key)];
         config.network.allowed_compiler_signers = vec![compiler_signer];
+    config.network.fee_treasury_address = Some(fee_treasury);
+    config.network.slash_sink_address = Some(slash_sink);
+    config.network.fee_vault_address = Some(fee_vault);
+    config.network.validator_fee_pool_address = Some(validator_fee_pool);
 
         let mut defaults = DeployPlanArgs::default();
         defaults.plan = Some(plan_path.to_string_lossy().into_owned());

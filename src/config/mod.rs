@@ -41,6 +41,18 @@ pub struct NetworkConfig {
     pub rate_limit_per_minute: Option<u64>,
     #[serde(default)]
     pub metadata_base_url: Option<String>,
+    #[serde(default)]
+    pub fee_treasury_address: Option<String>,
+    #[serde(default)]
+    pub slash_sink_address: Option<String>,
+    #[serde(default)]
+    pub fee_vault_address: Option<String>,
+    #[serde(default)]
+    pub validator_fee_pool_address: Option<String>,
+    #[serde(default)]
+    pub fee_split_bps: Option<u16>,
+    #[serde(default)]
+    pub povc_split_bps: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +129,12 @@ impl Default for Config {
                 auth_token: None,
                 rate_limit_per_minute: Some(60),
                 metadata_base_url: None,
+                fee_treasury_address: None,
+                slash_sink_address: None,
+                fee_vault_address: None,
+                validator_fee_pool_address: None,
+                fee_split_bps: Some(10_000),
+                povc_split_bps: Some(10_000),
             },
             node: NodeConfig {
                 data_dir: dirs::home_dir()
@@ -230,6 +248,12 @@ fn apply_network_preset(config: &mut Config, network: &str) {
             config.network.allowed_signers = signers_vec_for_network("mainnet");
             config.network.allowed_compiler_signers = compiler_signers_vec_for_network("mainnet");
             config.network.rate_limit_per_minute = Some(120);
+            config.network.fee_treasury_address = None;
+            config.network.slash_sink_address = None;
+            config.network.fee_vault_address = None;
+            config.network.validator_fee_pool_address = None;
+            config.network.fee_split_bps = Some(10_000);
+            config.network.povc_split_bps = Some(10_000);
         }
         "devnet" | "omne_devnet" => {
             config.network.name = network.to_string();
@@ -241,6 +265,12 @@ fn apply_network_preset(config: &mut Config, network: &str) {
             config.network.allowed_signers = signers_vec_for_network("devnet");
             config.network.allowed_compiler_signers = compiler_signers_vec_for_network("devnet");
             config.network.rate_limit_per_minute = None;
+            config.network.fee_treasury_address = None;
+            config.network.slash_sink_address = None;
+            config.network.fee_vault_address = None;
+            config.network.validator_fee_pool_address = None;
+            config.network.fee_split_bps = Some(10_000);
+            config.network.povc_split_bps = Some(10_000);
         }
         "testnet" | "omne_testnet" => {
             config.network.name = network.to_string();
@@ -255,6 +285,12 @@ fn apply_network_preset(config: &mut Config, network: &str) {
             config.network.auth_token = None;
             config.network.rate_limit_per_minute = Some(60);
             config.network.metadata_base_url = None;
+            config.network.fee_treasury_address = None;
+            config.network.slash_sink_address = None;
+            config.network.fee_vault_address = None;
+            config.network.validator_fee_pool_address = None;
+            config.network.fee_split_bps = Some(10_000);
+            config.network.povc_split_bps = Some(10_000);
         }
         _ => {
             // Unknown networks keep the default configuration
