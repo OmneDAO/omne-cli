@@ -1,13 +1,14 @@
 //! Helpers for inspecting compiled WASM contracts and extracting Omne ABI metadata.
 
 use anyhow::{anyhow, bail, Context, Result};
+use axiom_runtime::abi::{self, EntryParamType};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
 use tokio::fs;
-use wasmparser::{Parser, Payload};
+use wasmparser::{CompositeInnerType, ExternalKind, FuncType, Parser, Payload, TypeRef, ValType};
 
 /// Representation of a compiled contract module with extracted metadata.
 #[derive(Debug, Clone)]
@@ -175,6 +176,8 @@ pub async fn load_contract_module(path: impl AsRef<Path>) -> Result<ContractModu
         );
     }
 
+    validate_entry_abi_signature(&bytes)?;
+
     let mut contract_methods: Vec<_> = methods.into_values().collect();
     contract_methods.sort_by(|a, b| {
         a.contract
@@ -201,6 +204,110 @@ pub async fn load_contract_module(path: impl AsRef<Path>) -> Result<ContractModu
             contract_methods,
         },
     })
+}
+
+pub fn validate_entry_abi_signature(bytes: &[u8]) -> Result<()> {
+    let mut types: Vec<FuncType> = Vec::new();
+    let mut function_type_indices: Vec<u32> = Vec::new();
+    let mut import_function_count: u32 = 0;
+    let mut entry_function_index: Option<u32> = None;
+
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload? {
+            Payload::TypeSection(reader) => {
+                for group in reader {
+                    let group = group?;
+                    for ty in group.types() {
+                        if let CompositeInnerType::Func(func) = &ty.composite_type.inner {
+                            types.push(func.clone());
+                        }
+                    }
+                }
+            }
+            Payload::ImportSection(reader) => {
+                for import in reader {
+                    let import = import?;
+                    if let TypeRef::Func(_) = import.ty {
+                        import_function_count += 1;
+                    }
+                }
+            }
+            Payload::FunctionSection(reader) => {
+                for ty in reader {
+                    function_type_indices.push(ty?);
+                }
+            }
+            Payload::ExportSection(reader) => {
+                for export in reader {
+                    let export = export?;
+                    if export.name == abi::ENTRY_EXPORT {
+                        if let ExternalKind::Func = export.kind {
+                            entry_function_index = Some(export.index);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let entry_index = entry_function_index.ok_or_else(|| {
+        anyhow!(
+            "contract module is missing '{}' export; recompile with the 9-arg ABI",
+            abi::ENTRY_EXPORT
+        )
+    })?;
+
+    if entry_index < import_function_count {
+        bail!(
+            "entry export '{}' must be a defined function",
+            abi::ENTRY_EXPORT
+        );
+    }
+
+    let defined_index = (entry_index - import_function_count) as usize;
+    let type_index = *function_type_indices
+        .get(defined_index)
+        .ok_or_else(|| anyhow!("entry export '{}' is missing a function type", abi::ENTRY_EXPORT))?;
+    let func_type = types
+        .get(type_index as usize)
+        .ok_or_else(|| anyhow!("entry export '{}' is missing a type entry", abi::ENTRY_EXPORT))?;
+
+    let expected_params: Vec<ValType> = abi::ENTRY_PARAM_TYPES
+        .iter()
+        .map(map_entry_param_type)
+        .collect();
+    let actual_params = func_type.params();
+    if actual_params.len() != expected_params.len()
+        || !actual_params.iter().zip(expected_params.iter()).all(|(a, b)| a == b)
+    {
+        bail!(
+            "entry export '{}' has invalid parameter types; expected {:?}, got {:?}",
+            abi::ENTRY_EXPORT,
+            expected_params,
+            actual_params
+        );
+    }
+
+    let expected_result = map_entry_param_type(&abi::ENTRY_RETURN_TYPE);
+    let actual_results = func_type.results();
+    if actual_results.len() != 1 || actual_results[0] != expected_result {
+        bail!(
+            "entry export '{}' has invalid return type; expected {:?}, got {:?}",
+            abi::ENTRY_EXPORT,
+            expected_result,
+            actual_results
+        );
+    }
+
+    Ok(())
+}
+
+fn map_entry_param_type(param: &EntryParamType) -> ValType {
+    match param {
+        EntryParamType::I32 => ValType::I32,
+        EntryParamType::I64 => ValType::I64,
+    }
 }
 
 fn split_selector(selector: &str) -> Result<(String, String)> {
