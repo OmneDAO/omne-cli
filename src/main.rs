@@ -12,6 +12,7 @@ use tracing::{error, info};
 
 mod commands;
 mod config;
+mod plan;
 mod utils;
 mod wasm;
 

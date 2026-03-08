@@ -1,12 +1,19 @@
 //! Developer tools and project management commands
 
 use crate::config::Config;
+use crate::plan::{
+    CompilerAttachment, CompilerMetadataEnvelope, ExecutionPlan, ExecutionPreviewSummary,
+    PlanContract, PlanContractMetadata, PlanEntry, PlanExecution, PlanNetwork, PlanSignature,
+    TypedArgument, compute_abi_checksum, parse_address20, parse_i32_value, parse_i64_value,
+    parse_unsigned_to_i128, parse_unsigned_to_u128, validate_abi_arguments_for_entry,
+    validate_plan_metadata,
+};
 use crate::utils::{confirm, spinner};
 use crate::wasm;
 use anyhow::{anyhow, bail, Context, Result};
 use axiom_runtime::{
     execution::SerializableVal, AxiomEngine, ExecutionConfig as RuntimeExecutionConfig,
-    ExecutionResult, COMPUTEVM_GAS_LIMIT, COMPUTEVM_MAX_CALL_DEPTH, COMPUTEVM_STORAGE_BUDGET_BYTES,
+    COMPUTEVM_GAS_LIMIT, COMPUTEVM_MAX_CALL_DEPTH, COMPUTEVM_STORAGE_BUDGET_BYTES,
     COMPUTEVM_TIMEOUT_US, FASTVM_GAS_LIMIT, FASTVM_MAX_CALL_DEPTH, FASTVM_STORAGE_BUDGET_BYTES,
     FASTVM_TIMEOUT_US, STANDARDVM_GAS_LIMIT, STANDARDVM_MAX_CALL_DEPTH,
     STANDARDVM_STORAGE_BUDGET_BYTES, STANDARDVM_TIMEOUT_US,
@@ -16,7 +23,7 @@ use chrono::Utc;
 use clap::{ArgAction, Args, Subcommand, ValueEnum};
 use deploy_guardrails::{
     compiler_signers_vec_for_network, enforce_allowed_services, validate_execution_guardrails,
-    verify_metadata_signature, CompilerMetadata, CompilerMetadataSignature, PlanSignatureData,
+    verify_metadata_signature,
     SignerAllowList,
 };
 use dialoguer::Select;
@@ -25,7 +32,7 @@ use hex;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use reqwest::{header::{AUTHORIZATION, CONTENT_TYPE}, Client, StatusCode, Url};
-use serde::{de::{self, DeserializeOwned}, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{self, json, Number as JsonNumber, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -79,102 +86,6 @@ impl fmt::Display for DeployTier {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ExecutionPlan {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    generated_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    network: Option<PlanNetwork>,
-    contract: PlanContract,
-    execution: PlanExecution,
-    services: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    signature: Option<PlanSignature>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PlanNetwork {
-    name: String,
-    chain_id: u64,
-    rpc_endpoint: String,
-    ws_endpoint: String,
-    explorer_url: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PlanContract {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    path: Option<String>,
-    wasm_size_bytes: usize,
-    wasm_sha256: String,
-    wasm_base64: String,
-    deployment_nonce: String,
-    entry: PlanEntry,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metadata: Option<PlanContractMetadata>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PlanContractMetadata {
-    has_axiom_entry_main: bool,
-    has_legacy_entry_main: bool,
-    methods: Vec<wasm::ContractMethod>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    abi_sha256: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    compiler: Option<CompilerAttachment>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct CompilerAttachment {
-    metadata: CompilerMetadata,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    signature: Option<CompilerMetadataSignature>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CompilerMetadataEnvelope {
-    metadata: CompilerMetadata,
-    #[serde(default)]
-    signature: Option<CompilerMetadataSignature>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PlanEntry {
-    contract: String,
-    function: String,
-    selector: String,
-    export: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    legacy_export: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PlanExecution {
-    tier: String,
-    config: RuntimeExecutionConfig,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    typed_arguments: Vec<TypedArgument>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    input_base64: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    preview: Option<ExecutionResult>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    preview_summary: Option<ExecutionPreviewSummary>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ExecutionPreviewSummary {
-    execution_time_ms: u128,
-    gas_consumed: u64,
-    return_value: Option<SerializableVal>,
-    deterministic_state: String,
-    call_depth_used: u32,
-    storage_bytes_written: u64,
-}
-
-type PlanSignature = PlanSignatureData;
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 pub enum DeployOperation {
@@ -725,65 +636,10 @@ fn parse_caller_address(raw: &str) -> Result<[u8; 20]> {
     Ok(parse_address20(raw)?.0)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Address20([u8; 20]);
-
-impl Serialize for Address20 {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&format!("omne1{}", hex::encode(self.0)))
-    }
-}
-
-impl<'de> Deserialize<'de> for Address20 {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value: String = Deserialize::deserialize(deserializer)?;
-        parse_address20(&value).map_err(|err| de::Error::custom(err.to_string()))
-    }
-}
-
-fn parse_address20(raw: &str) -> Result<Address20> {
-    let trimmed = raw.trim();
-    let payload = if let Some(rest) = trimmed.strip_prefix("omne1") {
-        rest
-    } else if let Some(rest) = trimmed.strip_prefix("0x") {
-        rest
-    } else {
-        trimmed
-    };
-
-    if payload.len() != 40 {
-        bail!("address must encode 20 bytes (found {} hex chars)", payload.len());
-    }
-    if payload.chars().any(|c| c.is_ascii_uppercase()) {
-        bail!("address hex must be lowercase");
-    }
-    if !payload.chars().all(|c| c.is_ascii_hexdigit()) {
-        bail!("address must be valid lowercase hex (got: {})", raw);
-    }
-
-    let mut out = [0u8; 20];
-    hex::decode_to_slice(payload, &mut out)
-        .map_err(|_| anyhow!("address must be valid lowercase hex (got: {})", raw))?;
-    Ok(Address20(out))
-}
-
 fn merge_input_blob(current: Option<Vec<u8>>, mut next: Vec<u8>) -> Vec<u8> {
     let mut out = current.unwrap_or_default();
     out.append(&mut next);
     out
-}
-
-fn serialize_u128_as_string<S>(value: &u128, serializer: S) -> std::result::Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    serializer.serialize_str(&value.to_string())
 }
 
 struct ParsedArguments {
@@ -792,229 +648,6 @@ struct ParsedArguments {
     input_base64: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", content = "value", rename_all = "lowercase")]
-enum TypedArgument {
-    I32(i32),
-    U8(u8),
-    U32(u32),
-    I64(i64),
-    U64(u64),
-    #[serde(serialize_with = "serialize_u128_as_string")]
-    U128(u128),
-    F32(f32),
-    F64(f64),
-    Bool(bool),
-    String(String),
-    BytesBase64(String),
-    OptionString(Option<String>),
-    Address20(Address20),
-    OptionAddress20(Option<Address20>),
-}
-
-impl<'de> Deserialize<'de> for TypedArgument {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct RawTypedArgument {
-            #[serde(rename = "type")]
-            ty: String,
-            #[serde(default)]
-            value: JsonValue,
-        }
-
-        let raw = RawTypedArgument::deserialize(deserializer)?;
-        let kind = raw.ty.to_lowercase();
-
-        fn parse_via_str<T, F, E>(
-            value: JsonValue,
-            parser: F,
-            desc: &str,
-        ) -> Result<T, E>
-        where
-            F: Fn(&str) -> Result<T, anyhow::Error>,
-            E: de::Error,
-        {
-            match value {
-                JsonValue::String(s) => parser(&s).map_err(|err| E::custom(err.to_string())),
-                JsonValue::Number(n) => parser(&n.to_string())
-                    .map_err(|err| E::custom(err.to_string())),
-                other => Err(E::custom(format!(
-                    "expected {} as string or number, got {:?}",
-                    desc, other
-                ))),
-            }
-        }
-
-        match kind.as_str() {
-            "i32" => parse_via_str(raw.value, parse_i32_value, "i32").map(TypedArgument::I32),
-            "u8" => parse_via_str(raw.value, |s| parse_unsigned_to_u128(s, 8).map(|v| v as u8), "u8")
-                .map(TypedArgument::U8),
-            "u32" => parse_via_str(raw.value, |s| parse_unsigned_to_u128(s, 32).map(|v| v as u32), "u32")
-                .map(TypedArgument::U32),
-            "i64" => parse_via_str(raw.value, |s| parse_signed_int(s, 64).map(|v| v as i64), "i64")
-                .map(TypedArgument::I64),
-            "u64" => parse_via_str(raw.value, |s| parse_unsigned_to_u128(s, 64).map(|v| v as u64), "u64")
-                .map(TypedArgument::U64),
-            "u128" => parse_via_str(raw.value, |s| parse_unsigned_to_u128(s, 128), "u128")
-                .map(TypedArgument::U128),
-            "f32" => match raw.value {
-                JsonValue::Number(n) => n
-                    .as_f64()
-                    .map(|v| v as f32)
-                    .ok_or_else(|| de::Error::custom("invalid f32 value"))
-                    .map(TypedArgument::F32),
-                JsonValue::String(s) => s
-                    .parse::<f32>()
-                    .map(TypedArgument::F32)
-                    .map_err(|err| de::Error::custom(err.to_string())),
-                other => Err(de::Error::custom(format!("expected f32 as string or number, got {:?}", other))),
-            },
-            "f64" => match raw.value {
-                JsonValue::Number(n) => n
-                    .as_f64()
-                    .ok_or_else(|| de::Error::custom("invalid f64 value"))
-                    .map(TypedArgument::F64),
-                JsonValue::String(s) => s
-                    .parse::<f64>()
-                    .map(TypedArgument::F64)
-                    .map_err(|err| de::Error::custom(err.to_string())),
-                other => Err(de::Error::custom(format!("expected f64 as string or number, got {:?}", other))),
-            },
-            "bool" => match raw.value {
-                JsonValue::Bool(v) => Ok(TypedArgument::Bool(v)),
-                JsonValue::String(s) => s
-                    .parse::<bool>()
-                    .map(TypedArgument::Bool)
-                    .map_err(|err| de::Error::custom(err.to_string())),
-                other => Err(de::Error::custom(format!("expected bool as boolean or string, got {:?}", other))),
-            },
-            "string" => match raw.value {
-                JsonValue::String(s) => Ok(TypedArgument::String(s)),
-                other => Err(de::Error::custom(format!("expected string value, got {:?}", other))),
-            },
-            "bytesbase64" => match raw.value {
-                JsonValue::String(s) => Ok(TypedArgument::BytesBase64(s)),
-                other => Err(de::Error::custom(format!("expected base64 string value, got {:?}", other))),
-            },
-            "optionstring" => match raw.value {
-                JsonValue::String(s) => Ok(TypedArgument::OptionString(Some(s))),
-                JsonValue::Null => Ok(TypedArgument::OptionString(None)),
-                other => Err(de::Error::custom(format!("expected string or null for optionstring, got {:?}", other))),
-            },
-            "address20" => match raw.value {
-                JsonValue::String(s) => parse_address20(&s)
-                    .map(TypedArgument::Address20)
-                    .map_err(|err| de::Error::custom(err.to_string())),
-                other => Err(de::Error::custom(format!("expected hex string for address20, got {:?}", other))),
-            },
-            "optionaddress20" | "option<address20>" => match raw.value {
-                JsonValue::Null => Ok(TypedArgument::OptionAddress20(None)),
-                JsonValue::String(s) => parse_address20(&s)
-                    .map(|addr| TypedArgument::OptionAddress20(Some(addr)))
-                    .map_err(|err| de::Error::custom(err.to_string())),
-                other => Err(de::Error::custom(format!(
-                    "expected hex string or null for optionaddress20, got {:?}",
-                    other
-                ))),
-            },
-            other => Err(de::Error::custom(format!("unknown typed argument type: {}", other))),
-        }
-    }
-}
-
-fn parse_i32_value(value: &str) -> Result<i32> {
-    let parsed = parse_signed_int(value, 32)?;
-    if parsed < i32::MIN as i128 || parsed > i32::MAX as i128 {
-        bail!("value {} exceeds i32 range", value);
-    }
-    Ok(parsed as i32)
-}
-
-fn parse_i64_value(value: &str) -> Result<i64> {
-    let parsed = parse_signed_int(value, 64)?;
-    if parsed < i64::MIN as i128 || parsed > i64::MAX as i128 {
-        bail!("value {} exceeds i64 range", value);
-    }
-    Ok(parsed as i64)
-}
-
-fn parse_unsigned_to_u128(value: &str, bits: u32) -> Result<u128> {
-    let trimmed = value.trim();
-    let cleaned = trimmed.trim_start_matches('+');
-    let digits = cleaned
-        .strip_prefix("0x")
-        .or_else(|| cleaned.strip_prefix("0X"))
-        .unwrap_or(cleaned);
-    let radix = if cleaned.starts_with("0x") || cleaned.starts_with("0X") { 16 } else { 10 };
-    let parsed = u128::from_str_radix(digits, radix)
-        .map_err(|err| anyhow!("failed to parse u{} argument '{}': {}", bits, value, err))?;
-    if bits < 128 {
-        let limit = 1u128 << bits;
-        if parsed >= limit {
-            bail!("value {} exceeds u{} range", value, bits);
-        }
-    }
-    Ok(parsed)
-}
-
-fn parse_unsigned_to_i128(value: &str, bits: u32) -> Result<i128> {
-    let trimmed = value.trim();
-    let cleaned = trimmed.trim_start_matches('+');
-    let digits = cleaned
-        .strip_prefix("0x")
-        .or_else(|| cleaned.strip_prefix("0X"))
-        .unwrap_or(cleaned);
-    let radix = if cleaned.starts_with("0x") || cleaned.starts_with("0X") {
-        16
-    } else {
-        10
-    };
-    let parsed = i128::from_str_radix(digits, radix).map_err(|err| {
-        anyhow!(
-            "failed to parse unsigned {}-bit integer '{}': {}",
-            bits,
-            value,
-            err
-        )
-    })?;
-    if parsed < 0 {
-        bail!("value {} must be non-negative", value);
-    }
-    let max = (1i128 << bits) - 1;
-    if parsed > max {
-        bail!("value {} exceeds u{} range", value, bits);
-    }
-    Ok(parsed)
-}
-
-fn parse_signed_int(value: &str, bits: u32) -> Result<i128> {
-    let trimmed = value.trim();
-    let negative = trimmed.starts_with('-');
-    let unsigned = trimmed.trim_start_matches(['+', '-']);
-    let (digits, radix) = if unsigned.starts_with("0x") || unsigned.starts_with("0X") {
-        (&unsigned[2..], 16)
-    } else {
-        (unsigned, 10)
-    };
-    let magnitude = i128::from_str_radix(digits, radix).map_err(|err| {
-        anyhow!(
-            "failed to parse signed {}-bit integer '{}': {}",
-            bits,
-            value,
-            err
-        )
-    })?;
-    let signed_value = if negative { -magnitude } else { magnitude };
-    let min = -(1i128 << (bits - 1));
-    let max = (1i128 << (bits - 1)) - 1;
-    if signed_value < min || signed_value > max {
-        bail!("value {} exceeds i{} range", value, bits);
-    }
-    Ok(signed_value)
-}
 #[derive(Subcommand)]
 pub enum DevCommands {
     /// Create new Omne project
@@ -1576,9 +1209,9 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
             Ok(Some(receipt)) => {
                 submission.finish_with_message("✅ Execution plan submitted");
                 if let Some(address) = receipt.contract_address.as_deref() {
-                    if let Some((omne_addr, hex_addr)) = normalize_contract_address(address) {
-                        info!("   Contract Address: {} (0x: {})", omne_addr, hex_addr);
-                        println!("   Contract Address: {} (0x: {})", omne_addr, hex_addr);
+                    if let Some(omne_addr) = normalize_contract_address(address) {
+                        info!("   Contract Address: {}", omne_addr);
+                        println!("   Contract Address: {}", omne_addr);
                     } else {
                         info!("   Contract Address: {}", address);
                         println!("   Contract Address: {}", address);
@@ -1590,8 +1223,8 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
                 }
 
                 if let Some(transaction_id) = receipt.transaction_id.as_deref() {
-                    if let Some((omne_tx, hex_tx)) = normalize_transaction_id(transaction_id) {
-                        info!("   Transaction ID: {} (0x: {})", omne_tx, hex_tx);
+                    if let Some(omne_tx) = normalize_transaction_id(transaction_id) {
+                        info!("   Transaction ID: {}", omne_tx);
                     } else {
                         info!("   Transaction ID: {}", transaction_id);
                     }
@@ -1896,9 +1529,9 @@ async fn submit_deployment_plan(
         Ok(Some(receipt)) => {
             submission.finish_with_message("✅ Execution plan submitted");
             if let Some(address) = receipt.contract_address.as_deref() {
-                if let Some((omne_addr, hex_addr)) = normalize_contract_address(address) {
-                    info!("   Contract Address: {} (0x: {})", omne_addr, hex_addr);
-                    println!("   Contract Address: {} (0x: {})", omne_addr, hex_addr);
+                if let Some(omne_addr) = normalize_contract_address(address) {
+                    info!("   Contract Address: {}", omne_addr);
+                    println!("   Contract Address: {}", omne_addr);
                 } else {
                     info!("   Contract Address: {}", address);
                     println!("   Contract Address: {}", address);
@@ -2659,6 +2292,15 @@ fn build_execution_plan(
 
     let metadata = module.metadata();
 
+    if let Some(attachment) = compiler_attachment.as_ref() {
+        validate_abi_arguments_for_entry(
+            &method.contract,
+            &method.function,
+            &plan_typed_arguments,
+            &attachment.metadata,
+        )?;
+    }
+
     // Fail fast if callers try to sneak raw hex addresses as strings instead of Address20.
     enforce_address_argument_hygiene(&plan_typed_arguments)?;
 
@@ -2854,40 +2496,6 @@ fn compute_plan_digest(plan: &ExecutionPlan) -> Result<[u8; 32]> {
     .map_err(|err| anyhow!(err.to_string()))
 }
 
-fn compute_abi_checksum(methods: &[wasm::ContractMethod]) -> Result<String> {
-    let mut methods_sorted = methods.to_vec();
-    methods_sorted.sort_by(|a, b| {
-        a.contract
-            .cmp(&b.contract)
-            .then_with(|| a.function.cmp(&b.function))
-            .then_with(|| a.export.cmp(&b.export))
-    });
-    let json = serde_json::to_vec(&methods_sorted)?;
-    Ok(format!("{:x}", Sha256::digest(&json)))
-}
-
-fn validate_plan_metadata(plan: &ExecutionPlan) -> Result<()> {
-    let metadata = plan
-        .contract
-        .metadata
-        .as_ref()
-        .ok_or_else(|| anyhow!("execution plan is missing contract metadata; regenerate the plan"))?;
-
-    if metadata.methods.is_empty() {
-        bail!("execution plan metadata has no contract methods; regenerate with an updated compiler");
-    }
-
-    let recorded = metadata
-        .abi_sha256
-        .as_deref()
-        .ok_or_else(|| anyhow!("execution plan is missing ABI checksum; regenerate the plan"))?;
-    let computed = compute_abi_checksum(&metadata.methods)?;
-    if recorded != computed {
-        bail!("execution plan ABI checksum mismatch; regenerate the plan to refresh metadata");
-    }
-
-    Ok(())
-}
 
 fn looks_like_hex_address(value: &str) -> bool {
     let trimmed = value.trim();
@@ -2991,7 +2599,7 @@ struct JsonRpcError {
     data: Option<JsonValue>,
 }
 
-fn normalize_contract_address(raw: &str) -> Option<(String, String)> {
+fn normalize_contract_address(raw: &str) -> Option<String> {
     normalize_hex_identifier(
         raw,
         &["contract_"],
@@ -3000,7 +2608,7 @@ fn normalize_contract_address(raw: &str) -> Option<(String, String)> {
     )
 }
 
-fn normalize_transaction_id(raw: &str) -> Option<(String, String)> {
+fn normalize_transaction_id(raw: &str) -> Option<String> {
     normalize_hex_identifier(raw, &["txn_"], 64, "txn_")
 }
 
@@ -3009,7 +2617,7 @@ fn normalize_hex_identifier(
     accepted_prefixes: &[&str],
     expected_len: usize,
     canonical_prefix: &str,
-) -> Option<(String, String)> {
+) -> Option<String> {
     let trimmed = raw.trim();
 
     let payload = accepted_prefixes
@@ -3027,10 +2635,7 @@ fn normalize_hex_identifier(
     }
 
     let normalized = payload.to_ascii_lowercase();
-    Some((
-        format!("{}{}", canonical_prefix, normalized),
-        format!("0x{}", normalized),
-    ))
+    Some(format!("{}{}", canonical_prefix, normalized))
 }
 
 fn log_guardrail_notice(enforce_warning: bool, message: impl Into<String>) {
@@ -3113,6 +2718,7 @@ fn require_fee_routing_config(
 mod tests {
     use super::*;
     use axiom_runtime::execution::SerializableVal;
+    use deploy_guardrails::{CompilerMetadata, CompilerMetadataSignature};
     use ed25519_dalek::SigningKey;
     use httptest::{
         matchers::{all_of, matches, request},
@@ -3306,6 +2912,19 @@ mod tests {
         assert_eq!(signature.public_key_hex.len(), 64);
         assert_eq!(signature.signature_hex.len(), 128);
         assert_eq!(hex::encode(verifying_key).len(), 64);
+    }
+
+    #[test]
+    fn parse_address20_enforces_lowercase_and_length() {
+        // Valid lowercase hex parses and preserves bytes
+        let valid = parse_address20("0x1111111111111111111111111111111111111111").unwrap();
+        assert_eq!(hex::encode(valid.0), "1111111111111111111111111111111111111111");
+
+        // Reject uppercase hex
+        assert!(parse_address20("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_err());
+
+        // Reject incorrect length
+        assert!(parse_address20("0xdeadbeef").is_err());
     }
 
     #[tokio::test]
