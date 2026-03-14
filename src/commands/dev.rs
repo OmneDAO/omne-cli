@@ -12,11 +12,12 @@ use crate::utils::{confirm, spinner};
 use crate::wasm;
 use anyhow::{anyhow, bail, Context, Result};
 use axiom_runtime::{
-    execution::SerializableVal, AxiomEngine, ExecutionConfig as RuntimeExecutionConfig,
-    COMPUTEVM_GAS_LIMIT, COMPUTEVM_MAX_CALL_DEPTH, COMPUTEVM_STORAGE_BUDGET_BYTES,
-    COMPUTEVM_TIMEOUT_US, FASTVM_GAS_LIMIT, FASTVM_MAX_CALL_DEPTH, FASTVM_STORAGE_BUDGET_BYTES,
-    FASTVM_TIMEOUT_US, STANDARDVM_GAS_LIMIT, STANDARDVM_MAX_CALL_DEPTH,
-    STANDARDVM_STORAGE_BUDGET_BYTES, STANDARDVM_TIMEOUT_US,
+    execution::SerializableVal, state::StateManager, AxiomEngine,
+    ExecutionConfig as RuntimeExecutionConfig, COMPUTEVM_GAS_LIMIT, COMPUTEVM_MAX_CALL_DEPTH,
+    COMPUTEVM_STORAGE_BUDGET_BYTES, COMPUTEVM_TIMEOUT_US, FASTVM_GAS_LIMIT,
+    FASTVM_MAX_CALL_DEPTH, FASTVM_STORAGE_BUDGET_BYTES, FASTVM_TIMEOUT_US,
+    STANDARDVM_GAS_LIMIT, STANDARDVM_MAX_CALL_DEPTH, STANDARDVM_STORAGE_BUDGET_BYTES,
+    STANDARDVM_TIMEOUT_US,
 };
 use base64ct::{Base64, Encoding};
 use chrono::Utc;
@@ -36,8 +37,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{self, json, Number as JsonNumber, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 use tracing::{info, warn};
@@ -173,6 +175,10 @@ pub struct DeployPlanArgs {
     #[arg(long)]
     pub skip_preview: bool,
 
+    /// Allow unsigned compiler metadata (dev-only preview workflows)
+    #[arg(long)]
+    pub allow_unsigned_metadata: bool,
+
     /// Raw function arguments provided as TYPE:VALUE (e.g. i32:42, i64:0xFF)
     #[arg(long = "arg", value_name = "TYPE:VALUE", action = ArgAction::Append)]
     pub arguments: Vec<String>,
@@ -213,6 +219,7 @@ impl Default for DeployPlanArgs {
             gas_limit: None,
             caller_address: None,
             skip_preview: false,
+            allow_unsigned_metadata: false,
             arguments: Vec::new(),
             signing_key: None,
             no_sign: false,
@@ -291,6 +298,7 @@ struct DeployPlanTemplate {
     gas_limit: Option<u64>,
     caller_address: Option<String>,
     skip_preview: Option<bool>,
+    allow_unsigned_metadata: Option<bool>,
     signing_key: Option<String>,
     no_sign: Option<bool>,
     no_submit: Option<bool>,
@@ -315,6 +323,7 @@ struct ResolvedDeployPlan {
     gas_limit: Option<u64>,
     caller_address: Option<[u8; 20]>,
     skip_preview: bool,
+    allow_unsigned_metadata: bool,
     signing_key: Option<String>,
     no_sign: bool,
     no_submit: bool,
@@ -435,6 +444,12 @@ async fn resolve_plan_args(args: &DeployPlanArgs, config: &Config) -> Result<Res
         .clone()
         .or_else(|| template.signing_key.clone());
 
+    let allow_unsigned_metadata = if args.allow_unsigned_metadata {
+        true
+    } else {
+        template.allow_unsigned_metadata.unwrap_or(false)
+    };
+
     let no_sign = if args.no_sign {
         true
     } else {
@@ -480,6 +495,7 @@ async fn resolve_plan_args(args: &DeployPlanArgs, config: &Config) -> Result<Res
         gas_limit,
         caller_address,
         skip_preview,
+        allow_unsigned_metadata,
         signing_key,
         no_sign,
         no_submit,
@@ -1062,6 +1078,11 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
             }
         };
 
+        let allow_unsigned_metadata = resolved.allow_unsigned_metadata
+            || (resolved.no_submit
+                && (resolved.network.eq_ignore_ascii_case("devnet")
+                    || resolved.network.eq_ignore_ascii_case("omne_devnet")));
+
         let mut execution_plan = build_execution_plan(
             &module,
             selected_method,
@@ -1075,6 +1096,7 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
             compiler_attachment.clone(),
             resolved.skip_preview,
             resolved.gas_limit,
+            allow_unsigned_metadata,
         )?;
 
         let mut plan_signer: Option<[u8; 32]> = None;
@@ -2224,6 +2246,7 @@ fn build_execution_plan(
     compiler_attachment: Option<CompilerAttachment>,
     skip_preview: bool,
     gas_limit_override: Option<u64>,
+    allow_unsigned_metadata: bool,
 ) -> Result<ExecutionPlan> {
     let mut exec_config = tier.build_execution_config(&method.contract, &method.function);
     if let Some(limit) = gas_limit_override {
@@ -2235,14 +2258,10 @@ fn build_execution_plan(
     }
 
     // Default to preserving typed arguments so runtimes can materialize pointer/length
-    // pairs server-side. Only fall back to numeric arguments when no typed payload is
-    // provided.
+    // pairs server-side. If the args are purely numeric, we can still run previews
+    // by passing the numeric list into the engine.
     let plan_typed_arguments = typed_arguments.to_vec();
     let plan_input_base64 = input_base64.clone();
-
-    if typed_arguments.is_empty() && !numeric_arguments.is_empty() {
-        exec_config.arguments = numeric_arguments.to_vec();
-    }
     validate_execution_guardrails(
         tier.as_str(),
         exec_config.max_call_depth,
@@ -2250,32 +2269,45 @@ fn build_execution_plan(
     )
     .map_err(|err| anyhow!(err.to_string()))?;
     let engine = create_engine(&tier)?;
-    let typed_requires_memory = typed_arguments
-        .iter()
-        .any(|arg| {
-            matches!(
-                arg,
-                TypedArgument::String(_)
-                    | TypedArgument::BytesBase64(_)
-                    | TypedArgument::OptionString(Some(_))
-                    | TypedArgument::Address20(_)
-                    | TypedArgument::OptionAddress20(Some(_))
-            )
-        });
+    let typed_requires_memory = typed_arguments.iter().any(|arg| {
+        matches!(
+            arg,
+            TypedArgument::String(_)
+                | TypedArgument::BytesBase64(_)
+                | TypedArgument::OptionString(Some(_))
+                | TypedArgument::Address20(_)
+                | TypedArgument::OptionAddress20(Some(_))
+        )
+    });
 
-    let should_skip_preview = skip_preview || typed_requires_memory;
-
-    if typed_requires_memory && !skip_preview {
-        warn!(
-            "Skipping execution preview: string/bytes arguments require runtime injection"
-        );
+    if !typed_requires_memory && !numeric_arguments.is_empty() {
+        exec_config.arguments = numeric_arguments.to_vec();
     }
+
+    let should_skip_preview = skip_preview;
 
     let (execution_preview, preview_summary) = if should_skip_preview {
         (None, None)
     } else {
+        let (mut preview_config, preview_input) = materialize_preview_arguments(
+            &exec_config,
+            typed_arguments,
+            input_base64.as_deref(),
+        )?;
+        if preview_config.contract_address.is_none() {
+            preview_config = preview_config.with_contract_address(
+                derive_preview_contract_address(module.bytes()),
+            );
+        }
+        let state_manager = Arc::new(StateManager::new_fastvm_optimized()?);
         let execution_preview = engine
-            .execute(module.bytes(), exec_config.clone())
+            .execute_with_state_and_input(
+                module.bytes(),
+                preview_config,
+                state_manager,
+                preview_input.as_deref(),
+            )
+            .map(|(res, _)| res)
             .map_err(|err| anyhow!("contract execution preview failed: {}", err))?;
 
         let preview_summary = ExecutionPreviewSummary {
@@ -2331,12 +2363,23 @@ fn build_execution_plan(
                 );
             }
 
-            let signature = attachment.signature.as_ref().ok_or_else(|| {
-                anyhow!(
-                    "compiler metadata for {} is unsigned; re-run compiler with signing enabled",
-                    module.path().display()
-                )
-            })?;
+            let signature = match attachment.signature.as_ref() {
+                Some(signature) => Some(signature),
+                None => {
+                    if allow_unsigned_metadata {
+                        warn!(
+                            "⚠️ Compiler metadata for {} is unsigned; skipping signature verification",
+                            module.path().display()
+                        );
+                        None
+                    } else {
+                        return Err(anyhow!(
+                            "compiler metadata for {} is unsigned; re-run compiler with signing enabled",
+                            module.path().display()
+                        ));
+                    }
+                }
+            };
 
             let allow_entries = if config.network.allowed_compiler_signers.is_empty() {
                 compiler_signers_vec_for_network(&config.network.name)
@@ -2348,14 +2391,16 @@ fn build_execution_plan(
                 SignerAllowList::from_hex_iter(allow_entries.iter().map(|s| s.as_str()))
                     .map_err(|err| anyhow!(err.to_string()))?;
 
-            let verifying_key =
-                verify_metadata_signature(&attachment.metadata, signature, Some(&allow_list))
-                    .map_err(|err| anyhow!(err.to_string()))?;
+            if let Some(signature) = signature {
+                let verifying_key =
+                    verify_metadata_signature(&attachment.metadata, signature, Some(&allow_list))
+                        .map_err(|err| anyhow!(err.to_string()))?;
 
-            info!(
-                "   Compiler metadata signature verified (signer {})",
-                hex::encode(verifying_key.to_bytes())
-            );
+                info!(
+                    "   Compiler metadata signature verified (signer {})",
+                    hex::encode(verifying_key.to_bytes())
+                );
+            }
 
             Some(attachment)
         }
@@ -2403,6 +2448,214 @@ fn build_execution_plan(
         services: services.to_vec(),
         signature: None,
     })
+}
+
+fn materialize_preview_arguments(
+    config: &RuntimeExecutionConfig,
+    typed_arguments: &[TypedArgument],
+    input_base64: Option<&str>,
+) -> Result<(RuntimeExecutionConfig, Option<Vec<u8>>)> {
+    let mut arguments = config.arguments.clone();
+    let mut input_buffer = if !typed_arguments.is_empty() {
+        if let Some(encoded) = input_base64 {
+            if !encoded.trim().is_empty() {
+                warn!(
+                    "preview ignoring input_base64 because typed arguments are provided"
+                );
+            }
+        }
+        Vec::new()
+    } else {
+        match input_base64 {
+            Some(encoded) if !encoded.trim().is_empty() => Base64::decode_vec(encoded)
+                .map_err(|err| anyhow!("Invalid input_base64 payload: {err}"))?,
+            _ => Vec::new(),
+        }
+    };
+    let initial_len = input_buffer.len();
+    let mut offset = u32::try_from(input_buffer.len())
+        .map_err(|_| anyhow!("Input payload exceeds 4GB"))?;
+
+    let mut pointer_debug = Vec::new();
+
+    for (idx, arg) in typed_arguments.iter().enumerate() {
+        match arg {
+            TypedArgument::I32(v) => {
+                arguments.push(SerializableVal::I32(*v));
+            }
+            TypedArgument::U8(v) => {
+                arguments.push(SerializableVal::I32(i32::from(*v)));
+            }
+            TypedArgument::U32(v) => {
+                let as_i32 = i32::try_from(*v)
+                    .map_err(|_| anyhow!("U32 argument exceeds i32 range"))?;
+                arguments.push(SerializableVal::I32(as_i32));
+            }
+            TypedArgument::I64(v) => {
+                arguments.push(SerializableVal::I64(*v));
+            }
+            TypedArgument::U64(v) => {
+                let as_i64 = i64::try_from(*v)
+                    .map_err(|_| anyhow!("U64 argument exceeds i64 range"))?;
+                arguments.push(SerializableVal::I64(as_i64));
+            }
+            TypedArgument::U128(v) => {
+                let lo = (*v as u64).to_le_bytes();
+                let hi = ((*v >> 64) as u64).to_le_bytes();
+                let lo_i64 = i64::from_le_bytes(lo);
+                let hi_i64 = i64::from_le_bytes(hi);
+                arguments.push(SerializableVal::I64(lo_i64));
+                arguments.push(SerializableVal::I64(hi_i64));
+            }
+            TypedArgument::F32(v) => {
+                arguments.push(SerializableVal::F32(*v));
+            }
+            TypedArgument::F64(v) => {
+                arguments.push(SerializableVal::F64(*v));
+            }
+            TypedArgument::Bool(v) => {
+                arguments.push(SerializableVal::I32(i32::from(*v)));
+            }
+            TypedArgument::String(text) => {
+                let payload_len = 4 + text.as_bytes().len();
+                let ptr = write_len_prefixed_blob(text.as_bytes(), &mut input_buffer, &mut offset)?;
+                pointer_debug.push(format!(
+                    "arg[{idx}] string ptr=0x{ptr:x} len={payload_len}"
+                ));
+                arguments.push(SerializableVal::I32(ptr));
+            }
+            TypedArgument::OptionString(value) => {
+                let (ptr, payload_len) = if let Some(text) = value {
+                    let mut payload = vec![1u8];
+                    payload.extend_from_slice(&encode_len_prefixed_bytes(text.as_bytes())?);
+                    let len = payload.len();
+                    let ptr = write_raw_blob(&payload, &mut input_buffer, &mut offset)?;
+                    (ptr, len)
+                } else {
+                    let ptr = write_raw_blob(&[0u8], &mut input_buffer, &mut offset)?;
+                    (ptr, 1)
+                };
+                pointer_debug.push(format!(
+                    "arg[{idx}] option<string> ptr=0x{ptr:x} len={payload_len}"
+                ));
+                arguments.push(SerializableVal::I32(ptr));
+            }
+            TypedArgument::Address20(addr) => {
+                let payload_len = 4 + addr.0.len();
+                let ptr = write_len_prefixed_blob(&addr.0, &mut input_buffer, &mut offset)?;
+                pointer_debug.push(format!(
+                    "arg[{idx}] address20 ptr=0x{ptr:x} len={payload_len}"
+                ));
+                arguments.push(SerializableVal::I32(ptr));
+            }
+            TypedArgument::OptionAddress20(value) => {
+                let (ptr, payload_len) = if let Some(addr) = value {
+                    let mut payload = vec![1u8];
+                    payload.extend_from_slice(&encode_len_prefixed_bytes(&addr.0)?);
+                    let len = payload.len();
+                    let ptr = write_raw_blob(&payload, &mut input_buffer, &mut offset)?;
+                    (ptr, len)
+                } else {
+                    let ptr = write_raw_blob(&[0u8], &mut input_buffer, &mut offset)?;
+                    (ptr, 1)
+                };
+                pointer_debug.push(format!(
+                    "arg[{idx}] option<address20> ptr=0x{ptr:x} len={payload_len}"
+                ));
+                arguments.push(SerializableVal::I32(ptr));
+            }
+            TypedArgument::BytesBase64(encoded) => {
+                let decoded = Base64::decode_vec(encoded)
+                    .map_err(|err| anyhow!("Invalid base64 argument: {err}"))?;
+                let payload_len = 4 + decoded.len();
+                let ptr = write_len_prefixed_blob(&decoded, &mut input_buffer, &mut offset)?;
+                pointer_debug.push(format!(
+                    "arg[{idx}] bytes ptr=0x{ptr:x} len={payload_len}"
+                ));
+                arguments.push(SerializableVal::I32(ptr));
+            }
+        }
+    }
+
+    let updated_config = if arguments.is_empty() {
+        config.clone()
+    } else {
+        config.clone().with_arguments(arguments)
+    };
+
+    if !input_buffer.is_empty() {
+        let preview_len = input_buffer.len().min(64);
+        let mut preview = String::with_capacity(preview_len * 2);
+        for byte in input_buffer.iter().take(preview_len) {
+            let _ = write!(preview, "{:02x}", byte);
+        }
+        info!(
+            "preview input buffer: initial_len={} final_len={} head={}{}",
+            initial_len,
+            input_buffer.len(),
+            preview,
+            if input_buffer.len() > preview_len { "..." } else { "" }
+        );
+    }
+
+    for line in pointer_debug {
+        info!("preview arg materialize: {line}");
+    }
+
+    let input_bytes = if input_buffer.is_empty() {
+        None
+    } else {
+        Some(input_buffer)
+    };
+
+    Ok((updated_config, input_bytes))
+}
+
+fn write_len_prefixed_blob(
+    bytes: &[u8],
+    input_buffer: &mut Vec<u8>,
+    offset: &mut u32,
+) -> Result<i32> {
+    let encoded = encode_len_prefixed_bytes(bytes)?;
+    write_raw_blob(&encoded, input_buffer, offset)
+}
+
+fn write_raw_blob(
+    bytes: &[u8],
+    input_buffer: &mut Vec<u8>,
+    offset: &mut u32,
+) -> Result<i32> {
+    const WASM_INPUT_BASE_ADDR: u32 = 0x10000;
+    let len = u32::try_from(bytes.len()).map_err(|_| anyhow!("Input payload exceeds 4GB"))?;
+    let addr = WASM_INPUT_BASE_ADDR
+        .checked_add(*offset)
+        .ok_or_else(|| anyhow!("Input payload exceeds i32 addressable range"))?;
+    let ptr = i32::try_from(addr)
+        .map_err(|_| anyhow!("Input payload exceeds i32 addressable range"))?;
+
+    let new_offset = offset
+        .checked_add(len)
+        .ok_or_else(|| anyhow!("Input payload exceeds 4GB"))?;
+
+    input_buffer.extend_from_slice(bytes);
+    *offset = new_offset;
+
+    Ok(ptr)
+}
+
+fn encode_len_prefixed_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    let len = u32::try_from(bytes.len()).map_err(|_| anyhow!("Input payload exceeds 4GB"))?;
+    let mut out = Vec::with_capacity(4 + bytes.len());
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(bytes);
+    Ok(out)
+}
+
+fn derive_preview_contract_address(wasm: &[u8]) -> [u8; 20] {
+    let digest = Sha256::digest(wasm);
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&digest[..20]);
+    out
 }
 
 async fn sign_execution_plan(plan: &mut ExecutionPlan, key_path: &str) -> Result<[u8; 32]> {
@@ -2837,6 +3090,7 @@ mod tests {
             Some(compiler_attachment),
             false,
             None,
+            false,
         )
         .expect("plan build");
 
@@ -2895,6 +3149,7 @@ mod tests {
             Some(compiler_attachment),
             false,
             None,
+            false,
         )
         .expect("plan build");
 
@@ -2960,6 +3215,7 @@ mod tests {
             Some(compiler_attachment),
             false,
             None,
+            false,
         )
         .expect("plan build");
 
@@ -2975,10 +3231,10 @@ mod tests {
         let mut config = Config::default();
         config.network.allowed_signers = vec![hex::encode(verifying_key)];
         config.network.allowed_compiler_signers = vec![compiler_signer];
-    config.network.fee_treasury_address = Some(fee_treasury);
-    config.network.slash_sink_address = Some(slash_sink);
-    config.network.fee_vault_address = Some(fee_vault);
-    config.network.validator_fee_pool_address = Some(validator_fee_pool);
+        config.network.fee_treasury_address = Some(fee_treasury);
+        config.network.slash_sink_address = Some(slash_sink);
+        config.network.fee_vault_address = Some(fee_vault);
+        config.network.validator_fee_pool_address = Some(validator_fee_pool);
 
         let mut defaults = DeployPlanArgs::default();
         defaults.plan = Some(plan_path.to_string_lossy().into_owned());
@@ -3015,7 +3271,6 @@ mod tests {
                 "id": 1
             }))),
         );
-
         let mut config = Config::default();
         config.network.rpc_endpoint = server.url("/").to_string();
         config.network.ws_endpoint = "ws://test".to_string();
@@ -3034,6 +3289,7 @@ mod tests {
             None,
             false,
             None,
+            false,
         )
         .expect("plan build");
 
@@ -3069,6 +3325,7 @@ mod tests {
             None,
             false,
             None,
+            false,
         )
         .expect("plan build");
 

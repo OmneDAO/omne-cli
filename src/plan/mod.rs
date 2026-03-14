@@ -459,17 +459,25 @@ pub(crate) fn validate_abi_arguments_for_entry(
     })?;
 
     let expected_count = method.params.len();
-    if typed_arguments.len() != expected_count {
+    let (args_to_check, expected_count) = if typed_arguments.len() == expected_count + 1
+        && matches!(typed_arguments.first(), Some(TypedArgument::BytesBase64(_)))
+    {
+        (&typed_arguments[1..], expected_count)
+    } else {
+        (typed_arguments, expected_count)
+    };
+
+    if args_to_check.len() != expected_count {
         bail!(
             "ABI argument count mismatch for {}::{}: expected {}, got {}",
             contract,
             function,
             expected_count,
-            typed_arguments.len()
+            args_to_check.len()
         );
     }
 
-    for (index, (param, arg)) in method.params.iter().zip(typed_arguments).enumerate() {
+    for (index, (param, arg)) in method.params.iter().zip(args_to_check).enumerate() {
         let expected_kinds = abi_expected_kinds(&param.ty).ok_or_else(|| {
             anyhow!(
                 "unsupported ABI type '{}' for {}::{} parameter {}",
@@ -538,11 +546,31 @@ fn abi_expected_kinds(raw: &str) -> Option<Vec<AbiArgumentKind>> {
         "string" => Some(vec![AbiArgumentKind::String]),
         "address" | "address20" => Some(vec![AbiArgumentKind::Address20]),
         "bool" => Some(vec![AbiArgumentKind::Bool]),
-        "uint8" | "u8" => Some(vec![AbiArgumentKind::U8]),
-        "uint32" | "u32" => Some(vec![AbiArgumentKind::U32]),
-        "uint64" | "u64" => Some(vec![AbiArgumentKind::U64]),
-        "uint128" | "u128" => Some(vec![AbiArgumentKind::U128]),
-        "int32" | "i32" => Some(vec![AbiArgumentKind::I32]),
+        "uint8" | "u8" => Some(vec![
+            AbiArgumentKind::U8,
+            AbiArgumentKind::I32,
+            AbiArgumentKind::I64,
+        ]),
+        "uint32" | "u32" => Some(vec![
+            AbiArgumentKind::U32,
+            AbiArgumentKind::I32,
+            AbiArgumentKind::I64,
+        ]),
+        "uint64" | "u64" => Some(vec![AbiArgumentKind::U64, AbiArgumentKind::I64]),
+        "uint128" | "u128" => Some(vec![
+            AbiArgumentKind::U128,
+            AbiArgumentKind::U64,
+            AbiArgumentKind::I64,
+        ]),
+        "int32" | "i32" => Some(vec![
+            AbiArgumentKind::I32,
+            AbiArgumentKind::Bool,
+            AbiArgumentKind::String,
+            AbiArgumentKind::OptionString,
+            AbiArgumentKind::Address20,
+            AbiArgumentKind::OptionAddress20,
+            AbiArgumentKind::BytesBase64,
+        ]),
         "int64" | "i64" => Some(vec![AbiArgumentKind::I64]),
         "float32" | "f32" => Some(vec![AbiArgumentKind::F32]),
         "float64" | "f64" => Some(vec![AbiArgumentKind::F64]),
