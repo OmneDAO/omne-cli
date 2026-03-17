@@ -239,7 +239,7 @@ async fn render_simulated_status(detailed: bool, watch: Option<u64>) {
     println!("   Instant Finality Rate: 96.5%");
     println!("   Last Security Commit: 98,760");
     println!("   Proposer Reputation: 0.94");
-    println!("   Latest Finalized Block: 0xabc123...def0 (round 144, sigs 18)");
+    println!("   Latest Finalized Block: bh_abc123...def0 (round 144, sigs 18)");
 
     if detailed {
         println!("\n⚡ Performance Metrics:");

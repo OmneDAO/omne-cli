@@ -291,7 +291,7 @@ fn sign_metadata(
 ) -> Result<CompilerMetadataSignature> {
     let raw_key = fs::read_to_string(key_path)
         .with_context(|| format!("failed to read signing key at {}", key_path.display()))?;
-    let key_hex = raw_key.trim().trim_start_matches("0x");
+    let key_hex = raw_key.trim();
     let key_bytes = Vec::from_hex(key_hex).map_err(|err| anyhow!(err.to_string()))?;
     if key_bytes.len() != 32 {
         bail!("signing key must be 32 bytes, found {}", key_bytes.len());

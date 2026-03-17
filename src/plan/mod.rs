@@ -128,9 +128,8 @@ impl<'de> Deserialize<'de> for Address20 {
 
 pub(crate) fn parse_address20(raw: &str) -> Result<Address20> {
     let trimmed = raw.trim();
+    // Accept omne1-prefixed addresses or raw 40-char lowercase hex
     let payload = if let Some(rest) = trimmed.strip_prefix("omne1") {
-        rest
-    } else if let Some(rest) = trimmed.strip_prefix("0x") {
         rest
     } else {
         trimmed
@@ -149,6 +148,10 @@ pub(crate) fn parse_address20(raw: &str) -> Result<Address20> {
     let mut out = [0u8; 20];
     hex::decode_to_slice(payload, &mut out)
         .map_err(|_| anyhow!("address must be valid lowercase hex (got: {})", raw))?;
+    // Keep CLI validation aligned with RPC guardrails by rejecting the zero address.
+    if out.iter().all(|byte| *byte == 0) {
+        bail!("address cannot be the zero address");
+    }
     Ok(Address20(out))
 }
 
@@ -311,12 +314,8 @@ pub(crate) fn parse_i64_value(value: &str) -> Result<i64> {
 pub(crate) fn parse_unsigned_to_u128(value: &str, bits: u32) -> Result<u128> {
     let trimmed = value.trim();
     let cleaned = trimmed.trim_start_matches('+');
-    let digits = cleaned
-        .strip_prefix("0x")
-        .or_else(|| cleaned.strip_prefix("0X"))
-        .unwrap_or(cleaned);
-    let radix = if cleaned.starts_with("0x") || cleaned.starts_with("0X") { 16 } else { 10 };
-    let parsed = u128::from_str_radix(digits, radix)
+    // Parse as decimal only; no hex prefix support
+    let parsed = u128::from_str_radix(cleaned, 10)
         .map_err(|err| anyhow!("failed to parse u{} argument '{}': {}", bits, value, err))?;
     if bits < 128 {
         let limit = 1u128 << bits;
@@ -330,16 +329,8 @@ pub(crate) fn parse_unsigned_to_u128(value: &str, bits: u32) -> Result<u128> {
 pub(crate) fn parse_unsigned_to_i128(value: &str, bits: u32) -> Result<i128> {
     let trimmed = value.trim();
     let cleaned = trimmed.trim_start_matches('+');
-    let digits = cleaned
-        .strip_prefix("0x")
-        .or_else(|| cleaned.strip_prefix("0X"))
-        .unwrap_or(cleaned);
-    let radix = if cleaned.starts_with("0x") || cleaned.starts_with("0X") {
-        16
-    } else {
-        10
-    };
-    let parsed = i128::from_str_radix(digits, radix).map_err(|err| {
+    // Parse as decimal only; no hex prefix support
+    let parsed = i128::from_str_radix(cleaned, 10).map_err(|err| {
         anyhow!(
             "failed to parse unsigned {}-bit integer '{}': {}",
             bits,
@@ -359,12 +350,8 @@ pub(crate) fn parse_unsigned_to_i128(value: &str, bits: u32) -> Result<i128> {
 pub(crate) fn parse_signed_int(value: &str, bits: u32) -> Result<i128> {
     let trimmed = value.trim();
     let cleaned = trimmed.strip_prefix('+').unwrap_or(trimmed);
-    let digits = cleaned
-        .strip_prefix("0x")
-        .or_else(|| cleaned.strip_prefix("0X"))
-        .unwrap_or(cleaned);
-    let radix = if cleaned.starts_with("0x") || cleaned.starts_with("0X") { 16 } else { 10 };
-    let parsed = i128::from_str_radix(digits, radix)
+    // Parse as decimal only; no hex prefix support
+    let parsed = i128::from_str_radix(cleaned, 10)
         .map_err(|err| anyhow!("failed to parse signed {}-bit integer '{}': {}", bits, value, err))?;
     if bits < 128 {
         let limit = 1i128 << (bits - 1);
