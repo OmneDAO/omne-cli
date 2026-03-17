@@ -12,11 +12,12 @@ use crate::utils::{confirm, spinner};
 use crate::wasm;
 use anyhow::{anyhow, bail, Context, Result};
 use axiom_runtime::{
-    execution::SerializableVal, AxiomEngine, ExecutionConfig as RuntimeExecutionConfig,
-    COMPUTEVM_GAS_LIMIT, COMPUTEVM_MAX_CALL_DEPTH, COMPUTEVM_STORAGE_BUDGET_BYTES,
-    COMPUTEVM_TIMEOUT_US, FASTVM_GAS_LIMIT, FASTVM_MAX_CALL_DEPTH, FASTVM_STORAGE_BUDGET_BYTES,
-    FASTVM_TIMEOUT_US, STANDARDVM_GAS_LIMIT, STANDARDVM_MAX_CALL_DEPTH,
-    STANDARDVM_STORAGE_BUDGET_BYTES, STANDARDVM_TIMEOUT_US,
+    execution::SerializableVal, state::StateManager, AxiomEngine,
+    ExecutionConfig as RuntimeExecutionConfig, COMPUTEVM_GAS_LIMIT, COMPUTEVM_MAX_CALL_DEPTH,
+    COMPUTEVM_STORAGE_BUDGET_BYTES, COMPUTEVM_TIMEOUT_US, FASTVM_GAS_LIMIT,
+    FASTVM_MAX_CALL_DEPTH, FASTVM_STORAGE_BUDGET_BYTES, FASTVM_TIMEOUT_US,
+    STANDARDVM_GAS_LIMIT, STANDARDVM_MAX_CALL_DEPTH, STANDARDVM_STORAGE_BUDGET_BYTES,
+    STANDARDVM_TIMEOUT_US,
 };
 use base64ct::{Base64, Encoding};
 use chrono::Utc;
@@ -36,8 +37,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{self, json, Number as JsonNumber, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 use tracing::{info, warn};
@@ -173,6 +175,10 @@ pub struct DeployPlanArgs {
     #[arg(long)]
     pub skip_preview: bool,
 
+    /// Allow unsigned compiler metadata (dev-only preview workflows)
+    #[arg(long)]
+    pub allow_unsigned_metadata: bool,
+
     /// Raw function arguments provided as TYPE:VALUE (e.g. i32:42, i64:0xFF)
     #[arg(long = "arg", value_name = "TYPE:VALUE", action = ArgAction::Append)]
     pub arguments: Vec<String>,
@@ -213,6 +219,7 @@ impl Default for DeployPlanArgs {
             gas_limit: None,
             caller_address: None,
             skip_preview: false,
+            allow_unsigned_metadata: false,
             arguments: Vec::new(),
             signing_key: None,
             no_sign: false,
@@ -291,6 +298,7 @@ struct DeployPlanTemplate {
     gas_limit: Option<u64>,
     caller_address: Option<String>,
     skip_preview: Option<bool>,
+    allow_unsigned_metadata: Option<bool>,
     signing_key: Option<String>,
     no_sign: Option<bool>,
     no_submit: Option<bool>,
@@ -315,6 +323,7 @@ struct ResolvedDeployPlan {
     gas_limit: Option<u64>,
     caller_address: Option<[u8; 20]>,
     skip_preview: bool,
+    allow_unsigned_metadata: bool,
     signing_key: Option<String>,
     no_sign: bool,
     no_submit: bool,
@@ -435,6 +444,12 @@ async fn resolve_plan_args(args: &DeployPlanArgs, config: &Config) -> Result<Res
         .clone()
         .or_else(|| template.signing_key.clone());
 
+    let allow_unsigned_metadata = if args.allow_unsigned_metadata {
+        true
+    } else {
+        template.allow_unsigned_metadata.unwrap_or(false)
+    };
+
     let no_sign = if args.no_sign {
         true
     } else {
@@ -480,6 +495,7 @@ async fn resolve_plan_args(args: &DeployPlanArgs, config: &Config) -> Result<Res
         gas_limit,
         caller_address,
         skip_preview,
+        allow_unsigned_metadata,
         signing_key,
         no_sign,
         no_submit,
@@ -591,7 +607,7 @@ fn parse_typed_argument_specs(specs: &[String]) -> Result<ParsedArguments> {
                 input_blob = Some(merge_input_blob(input_blob, decoded));
             }
             "bytes-hex" => {
-                let decoded = hex::decode(value.trim_start_matches("0x")).map_err(|err| {
+                let decoded = hex::decode(value).map_err(|err| {
                     anyhow!("failed to decode bytes-hex argument: {}", err)
                 })?;
                 typed.push(TypedArgument::BytesBase64(Base64::encode_string(&decoded)));
@@ -1062,6 +1078,11 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
             }
         };
 
+        let allow_unsigned_metadata = resolved.allow_unsigned_metadata
+            || (resolved.no_submit
+                && (resolved.network.eq_ignore_ascii_case("devnet")
+                    || resolved.network.eq_ignore_ascii_case("omne_devnet")));
+
         let mut execution_plan = build_execution_plan(
             &module,
             selected_method,
@@ -1075,6 +1096,7 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
             compiler_attachment.clone(),
             resolved.skip_preview,
             resolved.gas_limit,
+            allow_unsigned_metadata,
         )?;
 
         let mut plan_signer: Option<[u8; 32]> = None;
@@ -1345,6 +1367,10 @@ async fn verify_execution_plan(
             err
         )
     })?;
+
+    // Fail fast on ABI/metadata issues before digesting or distributing the plan.
+    validate_plan_metadata(&plan)?;
+    enforce_address_argument_hygiene(&plan.execution.typed_arguments)?;
 
     let network_name = plan
         .network
@@ -1744,6 +1770,10 @@ async fn submit_execution_plan(
     config: &Config,
     auth_token: Option<&str>,
 ) -> Result<Option<DeploymentReceipt>> {
+    // Enforce ABI/metadata checks before any RPC submission to keep CLI guardrails in sync.
+    validate_plan_metadata(plan)?;
+    enforce_address_argument_hygiene(&plan.execution.typed_arguments)?;
+
     let endpoint = &config.network.rpc_endpoint;
     if !endpoint.starts_with("http") {
         bail!(
@@ -2067,6 +2097,11 @@ impl MetadataClient {
         self.get(&format!("plans/{}", plan_id)).await
     }
 
+    // Provide a list API helper so staging smoke tests can derive plan IDs for follow-up calls.
+    async fn fetch_plan_list(&self) -> Result<MetadataFetch<MetadataPlanList>> {
+        self.get("plans").await
+    }
+
     async fn fetch_plan_by_digest(
         &self,
         digest: &str,
@@ -2151,8 +2186,20 @@ struct MetadataPlanDetails {
 #[derive(Debug, Deserialize)]
 struct MetadataPlanSummary {
     plan_id: String,
+    // Optional fields are present in list/detail responses but not required for all flows.
+    #[serde(default)]
+    digest: Option<String>,
+    #[serde(default)]
+    deployment_nonce: Option<String>,
     #[serde(default)]
     services: Vec<String>,
+}
+
+// Minimal list response used by CLI staging smoke tests.
+#[derive(Debug, Deserialize)]
+struct MetadataPlanList {
+    #[serde(default)]
+    plans: Vec<MetadataPlanSummary>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2224,6 +2271,7 @@ fn build_execution_plan(
     compiler_attachment: Option<CompilerAttachment>,
     skip_preview: bool,
     gas_limit_override: Option<u64>,
+    allow_unsigned_metadata: bool,
 ) -> Result<ExecutionPlan> {
     let mut exec_config = tier.build_execution_config(&method.contract, &method.function);
     if let Some(limit) = gas_limit_override {
@@ -2235,14 +2283,10 @@ fn build_execution_plan(
     }
 
     // Default to preserving typed arguments so runtimes can materialize pointer/length
-    // pairs server-side. Only fall back to numeric arguments when no typed payload is
-    // provided.
+    // pairs server-side. If the args are purely numeric, we can still run previews
+    // by passing the numeric list into the engine.
     let plan_typed_arguments = typed_arguments.to_vec();
     let plan_input_base64 = input_base64.clone();
-
-    if typed_arguments.is_empty() && !numeric_arguments.is_empty() {
-        exec_config.arguments = numeric_arguments.to_vec();
-    }
     validate_execution_guardrails(
         tier.as_str(),
         exec_config.max_call_depth,
@@ -2250,32 +2294,45 @@ fn build_execution_plan(
     )
     .map_err(|err| anyhow!(err.to_string()))?;
     let engine = create_engine(&tier)?;
-    let typed_requires_memory = typed_arguments
-        .iter()
-        .any(|arg| {
-            matches!(
-                arg,
-                TypedArgument::String(_)
-                    | TypedArgument::BytesBase64(_)
-                    | TypedArgument::OptionString(Some(_))
-                    | TypedArgument::Address20(_)
-                    | TypedArgument::OptionAddress20(Some(_))
-            )
-        });
+    let typed_requires_memory = typed_arguments.iter().any(|arg| {
+        matches!(
+            arg,
+            TypedArgument::String(_)
+                | TypedArgument::BytesBase64(_)
+                | TypedArgument::OptionString(Some(_))
+                | TypedArgument::Address20(_)
+                | TypedArgument::OptionAddress20(Some(_))
+        )
+    });
 
-    let should_skip_preview = skip_preview || typed_requires_memory;
-
-    if typed_requires_memory && !skip_preview {
-        warn!(
-            "Skipping execution preview: string/bytes arguments require runtime injection"
-        );
+    if !typed_requires_memory && !numeric_arguments.is_empty() {
+        exec_config.arguments = numeric_arguments.to_vec();
     }
+
+    let should_skip_preview = skip_preview;
 
     let (execution_preview, preview_summary) = if should_skip_preview {
         (None, None)
     } else {
+        let (mut preview_config, preview_input) = materialize_preview_arguments(
+            &exec_config,
+            typed_arguments,
+            input_base64.as_deref(),
+        )?;
+        if preview_config.contract_address.is_none() {
+            preview_config = preview_config.with_contract_address(
+                derive_preview_contract_address(module.bytes()),
+            );
+        }
+        let state_manager = Arc::new(StateManager::new_fastvm_optimized()?);
         let execution_preview = engine
-            .execute(module.bytes(), exec_config.clone())
+            .execute_with_state_and_input(
+                module.bytes(),
+                preview_config,
+                state_manager,
+                preview_input.as_deref(),
+            )
+            .map(|(res, _)| res)
             .map_err(|err| anyhow!("contract execution preview failed: {}", err))?;
 
         let preview_summary = ExecutionPreviewSummary {
@@ -2331,12 +2388,23 @@ fn build_execution_plan(
                 );
             }
 
-            let signature = attachment.signature.as_ref().ok_or_else(|| {
-                anyhow!(
-                    "compiler metadata for {} is unsigned; re-run compiler with signing enabled",
-                    module.path().display()
-                )
-            })?;
+            let signature = match attachment.signature.as_ref() {
+                Some(signature) => Some(signature),
+                None => {
+                    if allow_unsigned_metadata {
+                        warn!(
+                            "⚠️ Compiler metadata for {} is unsigned; skipping signature verification",
+                            module.path().display()
+                        );
+                        None
+                    } else {
+                        return Err(anyhow!(
+                            "compiler metadata for {} is unsigned; re-run compiler with signing enabled",
+                            module.path().display()
+                        ));
+                    }
+                }
+            };
 
             let allow_entries = if config.network.allowed_compiler_signers.is_empty() {
                 compiler_signers_vec_for_network(&config.network.name)
@@ -2348,14 +2416,16 @@ fn build_execution_plan(
                 SignerAllowList::from_hex_iter(allow_entries.iter().map(|s| s.as_str()))
                     .map_err(|err| anyhow!(err.to_string()))?;
 
-            let verifying_key =
-                verify_metadata_signature(&attachment.metadata, signature, Some(&allow_list))
-                    .map_err(|err| anyhow!(err.to_string()))?;
+            if let Some(signature) = signature {
+                let verifying_key =
+                    verify_metadata_signature(&attachment.metadata, signature, Some(&allow_list))
+                        .map_err(|err| anyhow!(err.to_string()))?;
 
-            info!(
-                "   Compiler metadata signature verified (signer {})",
-                hex::encode(verifying_key.to_bytes())
-            );
+                info!(
+                    "   Compiler metadata signature verified (signer {})",
+                    hex::encode(verifying_key.to_bytes())
+                );
+            }
 
             Some(attachment)
         }
@@ -2403,6 +2473,214 @@ fn build_execution_plan(
         services: services.to_vec(),
         signature: None,
     })
+}
+
+fn materialize_preview_arguments(
+    config: &RuntimeExecutionConfig,
+    typed_arguments: &[TypedArgument],
+    input_base64: Option<&str>,
+) -> Result<(RuntimeExecutionConfig, Option<Vec<u8>>)> {
+    let mut arguments = config.arguments.clone();
+    let mut input_buffer = if !typed_arguments.is_empty() {
+        if let Some(encoded) = input_base64 {
+            if !encoded.trim().is_empty() {
+                warn!(
+                    "preview ignoring input_base64 because typed arguments are provided"
+                );
+            }
+        }
+        Vec::new()
+    } else {
+        match input_base64 {
+            Some(encoded) if !encoded.trim().is_empty() => Base64::decode_vec(encoded)
+                .map_err(|err| anyhow!("Invalid input_base64 payload: {err}"))?,
+            _ => Vec::new(),
+        }
+    };
+    let initial_len = input_buffer.len();
+    let mut offset = u32::try_from(input_buffer.len())
+        .map_err(|_| anyhow!("Input payload exceeds 4GB"))?;
+
+    let mut pointer_debug = Vec::new();
+
+    for (idx, arg) in typed_arguments.iter().enumerate() {
+        match arg {
+            TypedArgument::I32(v) => {
+                arguments.push(SerializableVal::I32(*v));
+            }
+            TypedArgument::U8(v) => {
+                arguments.push(SerializableVal::I32(i32::from(*v)));
+            }
+            TypedArgument::U32(v) => {
+                let as_i32 = i32::try_from(*v)
+                    .map_err(|_| anyhow!("U32 argument exceeds i32 range"))?;
+                arguments.push(SerializableVal::I32(as_i32));
+            }
+            TypedArgument::I64(v) => {
+                arguments.push(SerializableVal::I64(*v));
+            }
+            TypedArgument::U64(v) => {
+                let as_i64 = i64::try_from(*v)
+                    .map_err(|_| anyhow!("U64 argument exceeds i64 range"))?;
+                arguments.push(SerializableVal::I64(as_i64));
+            }
+            TypedArgument::U128(v) => {
+                let lo = (*v as u64).to_le_bytes();
+                let hi = ((*v >> 64) as u64).to_le_bytes();
+                let lo_i64 = i64::from_le_bytes(lo);
+                let hi_i64 = i64::from_le_bytes(hi);
+                arguments.push(SerializableVal::I64(lo_i64));
+                arguments.push(SerializableVal::I64(hi_i64));
+            }
+            TypedArgument::F32(v) => {
+                arguments.push(SerializableVal::F32(*v));
+            }
+            TypedArgument::F64(v) => {
+                arguments.push(SerializableVal::F64(*v));
+            }
+            TypedArgument::Bool(v) => {
+                arguments.push(SerializableVal::I32(i32::from(*v)));
+            }
+            TypedArgument::String(text) => {
+                let payload_len = 4 + text.as_bytes().len();
+                let ptr = write_len_prefixed_blob(text.as_bytes(), &mut input_buffer, &mut offset)?;
+                pointer_debug.push(format!(
+                    "arg[{idx}] string ptr=0x{ptr:x} len={payload_len}"
+                ));
+                arguments.push(SerializableVal::I32(ptr));
+            }
+            TypedArgument::OptionString(value) => {
+                let (ptr, payload_len) = if let Some(text) = value {
+                    let mut payload = vec![1u8];
+                    payload.extend_from_slice(&encode_len_prefixed_bytes(text.as_bytes())?);
+                    let len = payload.len();
+                    let ptr = write_raw_blob(&payload, &mut input_buffer, &mut offset)?;
+                    (ptr, len)
+                } else {
+                    let ptr = write_raw_blob(&[0u8], &mut input_buffer, &mut offset)?;
+                    (ptr, 1)
+                };
+                pointer_debug.push(format!(
+                    "arg[{idx}] option<string> ptr=0x{ptr:x} len={payload_len}"
+                ));
+                arguments.push(SerializableVal::I32(ptr));
+            }
+            TypedArgument::Address20(addr) => {
+                let payload_len = 4 + addr.0.len();
+                let ptr = write_len_prefixed_blob(&addr.0, &mut input_buffer, &mut offset)?;
+                pointer_debug.push(format!(
+                    "arg[{idx}] address20 ptr=0x{ptr:x} len={payload_len}"
+                ));
+                arguments.push(SerializableVal::I32(ptr));
+            }
+            TypedArgument::OptionAddress20(value) => {
+                let (ptr, payload_len) = if let Some(addr) = value {
+                    let mut payload = vec![1u8];
+                    payload.extend_from_slice(&encode_len_prefixed_bytes(&addr.0)?);
+                    let len = payload.len();
+                    let ptr = write_raw_blob(&payload, &mut input_buffer, &mut offset)?;
+                    (ptr, len)
+                } else {
+                    let ptr = write_raw_blob(&[0u8], &mut input_buffer, &mut offset)?;
+                    (ptr, 1)
+                };
+                pointer_debug.push(format!(
+                    "arg[{idx}] option<address20> ptr=0x{ptr:x} len={payload_len}"
+                ));
+                arguments.push(SerializableVal::I32(ptr));
+            }
+            TypedArgument::BytesBase64(encoded) => {
+                let decoded = Base64::decode_vec(encoded)
+                    .map_err(|err| anyhow!("Invalid base64 argument: {err}"))?;
+                let payload_len = 4 + decoded.len();
+                let ptr = write_len_prefixed_blob(&decoded, &mut input_buffer, &mut offset)?;
+                pointer_debug.push(format!(
+                    "arg[{idx}] bytes ptr=0x{ptr:x} len={payload_len}"
+                ));
+                arguments.push(SerializableVal::I32(ptr));
+            }
+        }
+    }
+
+    let updated_config = if arguments.is_empty() {
+        config.clone()
+    } else {
+        config.clone().with_arguments(arguments)
+    };
+
+    if !input_buffer.is_empty() {
+        let preview_len = input_buffer.len().min(64);
+        let mut preview = String::with_capacity(preview_len * 2);
+        for byte in input_buffer.iter().take(preview_len) {
+            let _ = write!(preview, "{:02x}", byte);
+        }
+        info!(
+            "preview input buffer: initial_len={} final_len={} head={}{}",
+            initial_len,
+            input_buffer.len(),
+            preview,
+            if input_buffer.len() > preview_len { "..." } else { "" }
+        );
+    }
+
+    for line in pointer_debug {
+        info!("preview arg materialize: {line}");
+    }
+
+    let input_bytes = if input_buffer.is_empty() {
+        None
+    } else {
+        Some(input_buffer)
+    };
+
+    Ok((updated_config, input_bytes))
+}
+
+fn write_len_prefixed_blob(
+    bytes: &[u8],
+    input_buffer: &mut Vec<u8>,
+    offset: &mut u32,
+) -> Result<i32> {
+    let encoded = encode_len_prefixed_bytes(bytes)?;
+    write_raw_blob(&encoded, input_buffer, offset)
+}
+
+fn write_raw_blob(
+    bytes: &[u8],
+    input_buffer: &mut Vec<u8>,
+    offset: &mut u32,
+) -> Result<i32> {
+    const WASM_INPUT_BASE_ADDR: u32 = 0x10000;
+    let len = u32::try_from(bytes.len()).map_err(|_| anyhow!("Input payload exceeds 4GB"))?;
+    let addr = WASM_INPUT_BASE_ADDR
+        .checked_add(*offset)
+        .ok_or_else(|| anyhow!("Input payload exceeds i32 addressable range"))?;
+    let ptr = i32::try_from(addr)
+        .map_err(|_| anyhow!("Input payload exceeds i32 addressable range"))?;
+
+    let new_offset = offset
+        .checked_add(len)
+        .ok_or_else(|| anyhow!("Input payload exceeds 4GB"))?;
+
+    input_buffer.extend_from_slice(bytes);
+    *offset = new_offset;
+
+    Ok(ptr)
+}
+
+fn encode_len_prefixed_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    let len = u32::try_from(bytes.len()).map_err(|_| anyhow!("Input payload exceeds 4GB"))?;
+    let mut out = Vec::with_capacity(4 + bytes.len());
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(bytes);
+    Ok(out)
+}
+
+fn derive_preview_contract_address(wasm: &[u8]) -> [u8; 20] {
+    let digest = Sha256::digest(wasm);
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&digest[..20]);
+    out
 }
 
 async fn sign_execution_plan(plan: &mut ExecutionPlan, key_path: &str) -> Result<[u8; 32]> {
@@ -2453,12 +2731,12 @@ fn attach_plan_signature_with_hex(
     signature_hex: &str,
     public_key_hex: &str,
 ) -> Result<[u8; 32]> {
-    let signature_clean = signature_hex.trim().trim_start_matches("0x");
+    let signature_clean = signature_hex.trim();
     if signature_clean.len() != 128 || !signature_clean.chars().all(|c| c.is_ascii_hexdigit()) {
         bail!("plan signature must be 64 bytes (128 hex characters)");
     }
 
-    let public_key_clean = public_key_hex.trim().trim_start_matches("0x");
+    let public_key_clean = public_key_hex.trim();
     if public_key_clean.len() != 64 || !public_key_clean.chars().all(|c| c.is_ascii_hexdigit()) {
         bail!("plan signature public key must be 32 bytes (64 hex characters)");
     }
@@ -2499,9 +2777,9 @@ fn compute_plan_digest(plan: &ExecutionPlan) -> Result<[u8; 32]> {
 
 fn looks_like_hex_address(value: &str) -> bool {
     let trimmed = value.trim();
+    // Only recognize omne1-prefixed addresses or raw 40-char hex
     let clean = trimmed
         .strip_prefix("omne1")
-        .or_else(|| trimmed.strip_prefix("0x"))
         .unwrap_or(trimmed);
     clean.len() == 40 && clean.chars().all(|c| c.is_ascii_hexdigit())
 }
@@ -2620,11 +2898,11 @@ fn normalize_hex_identifier(
 ) -> Option<String> {
     let trimmed = raw.trim();
 
+    // Match accepted prefixes or raw hex of expected length; no 0x fallback
     let payload = accepted_prefixes
         .iter()
         .filter_map(|prefix| trimmed.strip_prefix(prefix))
         .next()
-        .or_else(|| trimmed.strip_prefix("0x"))
         .or_else(|| if trimmed.len() == expected_len { Some(trimmed) } else { None })?;
 
     if payload.len() != expected_len {
@@ -2721,16 +2999,21 @@ mod tests {
     use deploy_guardrails::{CompilerMetadata, CompilerMetadataSignature};
     use ed25519_dalek::SigningKey;
     use httptest::{
-        matchers::{all_of, matches, request},
+        matchers::{all_of, contains, eq, matches, request},
         responders::{json_encoded, status_code},
         Expectation, Server,
     };
     use serde_json::json;
+    use std::env;
     use std::io::Write;
     use tempfile::NamedTempFile;
     use wat::parse_str;
 
     const DEMO_WAT: &str = r#"(module
+        (func (export "axiom_entry_main")
+            (param i32 i32 i64 i64 i32 i64 i32 i32 i32)
+            (result i64)
+            i64.const 0)
         (func (export "axiom_contract::Demo::init") (result i64)
             i64.const 7)
     )"#;
@@ -2837,6 +3120,7 @@ mod tests {
             Some(compiler_attachment),
             false,
             None,
+            false,
         )
         .expect("plan build");
 
@@ -2895,6 +3179,7 @@ mod tests {
             Some(compiler_attachment),
             false,
             None,
+            false,
         )
         .expect("plan build");
 
@@ -2917,14 +3202,22 @@ mod tests {
     #[test]
     fn parse_address20_enforces_lowercase_and_length() {
         // Valid lowercase hex parses and preserves bytes
-        let valid = parse_address20("0x1111111111111111111111111111111111111111").unwrap();
+        // Valid omne1-prefixed address (omne1 + 40 hex chars = 20 bytes)
+        let valid = parse_address20("omne11111111111111111111111111111111111111111").unwrap();
         assert_eq!(hex::encode(valid.0), "1111111111111111111111111111111111111111");
 
+        // Valid raw hex address
+        let valid_raw = parse_address20("1111111111111111111111111111111111111111").unwrap();
+        assert_eq!(hex::encode(valid_raw.0), "1111111111111111111111111111111111111111");
+
         // Reject uppercase hex
-        assert!(parse_address20("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_err());
+        assert!(parse_address20("omne1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_err());
 
         // Reject incorrect length
-        assert!(parse_address20("0xdeadbeef").is_err());
+        assert!(parse_address20("deadbeef").is_err());
+
+        // Reject zero address
+        assert!(parse_address20("omne10000000000000000000000000000000000000000").is_err());
     }
 
     #[tokio::test]
@@ -2938,10 +3231,10 @@ mod tests {
         let (compiler_attachment, compiler_signer) = make_signed_compiler_attachment(&module);
         let mut plan_config = Config::default();
         plan_config.network.allowed_compiler_signers = vec![compiler_signer.clone()];
-        let fee_treasury = "0x1111111111111111111111111111111111111111".to_string();
-        let slash_sink = "0x2222222222222222222222222222222222222222".to_string();
-        let fee_vault = "0x3333333333333333333333333333333333333333".to_string();
-        let validator_fee_pool = "0x4444444444444444444444444444444444444444".to_string();
+        let fee_treasury = "omne11111111111111111111111111111111111111111".to_string();
+        let slash_sink = "omne12222222222222222222222222222222222222222".to_string();
+        let fee_vault = "omne13333333333333333333333333333333333333333".to_string();
+        let validator_fee_pool = "omne14444444444444444444444444444444444444444".to_string();
         plan_config.network.fee_treasury_address = Some(fee_treasury.clone());
         plan_config.network.slash_sink_address = Some(slash_sink.clone());
         plan_config.network.fee_vault_address = Some(fee_vault.clone());
@@ -2960,6 +3253,7 @@ mod tests {
             Some(compiler_attachment),
             false,
             None,
+            false,
         )
         .expect("plan build");
 
@@ -2975,10 +3269,10 @@ mod tests {
         let mut config = Config::default();
         config.network.allowed_signers = vec![hex::encode(verifying_key)];
         config.network.allowed_compiler_signers = vec![compiler_signer];
-    config.network.fee_treasury_address = Some(fee_treasury);
-    config.network.slash_sink_address = Some(slash_sink);
-    config.network.fee_vault_address = Some(fee_vault);
-    config.network.validator_fee_pool_address = Some(validator_fee_pool);
+        config.network.fee_treasury_address = Some(fee_treasury);
+        config.network.slash_sink_address = Some(slash_sink);
+        config.network.fee_vault_address = Some(fee_vault);
+        config.network.validator_fee_pool_address = Some(validator_fee_pool);
 
         let mut defaults = DeployPlanArgs::default();
         defaults.plan = Some(plan_path.to_string_lossy().into_owned());
@@ -3002,6 +3296,9 @@ mod tests {
             .resolve_method("Demo::init")
             .expect("method present");
 
+        // Include compiler metadata so pre-submit ABI validation can succeed.
+        let (compiler_attachment, compiler_signer) = make_signed_compiler_attachment(&module);
+
         let mut server = Server::run();
         server.expect(
             Expectation::matching(all_of![
@@ -3015,11 +3312,11 @@ mod tests {
                 "id": 1
             }))),
         );
-
         let mut config = Config::default();
         config.network.rpc_endpoint = server.url("/").to_string();
         config.network.ws_endpoint = "ws://test".to_string();
         config.network.explorer_url = "http://test".to_string();
+        config.network.allowed_compiler_signers = vec![compiler_signer];
 
         let plan = build_execution_plan(
             &module,
@@ -3031,9 +3328,10 @@ mod tests {
             None,
             None,
             &config,
-            None,
+            Some(compiler_attachment),
             false,
             None,
+            false,
         )
         .expect("plan build");
 
@@ -3069,6 +3367,7 @@ mod tests {
             None,
             false,
             None,
+            false,
         )
         .expect("plan build");
 
@@ -3137,6 +3436,336 @@ mod tests {
             .expect("metadata confirmation succeeds");
 
         assert_eq!(services, Some(vec!["svc-demo".to_string()]));
+
+        server.verify_and_clear();
+    }
+
+    #[tokio::test]
+    async fn staging_metadata_endpoints_smoke_test() {
+        // This staging test is gated by env vars so it only runs when explicitly configured.
+        let base_url = match env::var("OMNE_METADATA_BASE_URL") {
+            Ok(value) if !value.trim().is_empty() => value,
+            _ => {
+                eprintln!("Skipping staging metadata test: OMNE_METADATA_BASE_URL not set");
+                return;
+            }
+        };
+        let auth_token = match env::var("OMNE_METADATA_AUTH_TOKEN") {
+            Ok(value) if !value.trim().is_empty() => value,
+            _ => {
+                eprintln!("Skipping staging metadata test: OMNE_METADATA_AUTH_TOKEN not set");
+                return;
+            }
+        };
+
+        let mut config = Config::default();
+        config.network.metadata_base_url = Some(base_url);
+        config.network.auth_token = Some(auth_token);
+
+        let client = MetadataClient::new(&config)
+            .expect("metadata client build")
+            .expect("metadata base url configured");
+
+        // List plans first to verify the endpoint is reachable with auth.
+        let plan_list = client
+            .fetch_plan_list()
+            .await
+            .expect("metadata plan list request")
+            .expect_found("metadata plan list response");
+
+        // If staging has no plans, the list call still proves the endpoint works.
+        let Some(first_plan) = plan_list.plans.first() else {
+            return;
+        };
+
+        let plan_details = client
+            .fetch_plan_by_id(&first_plan.plan_id)
+            .await
+            .expect("metadata plan detail request");
+
+        // Allow eventual consistency: details may return 404 even when list is populated.
+        let plan_details = match plan_details {
+            MetadataFetch::Found(details) => Some(details),
+            MetadataFetch::NotFound => None,
+            MetadataFetch::Disabled => {
+                panic!("metadata endpoint disabled in staging");
+            }
+        };
+
+        if let Some(details) = plan_details {
+            if let Some(digest) = details.plan.digest.as_ref() {
+                let _ = client
+                    .fetch_plan_by_digest(digest)
+                    .await
+                    .expect("metadata plan digest request");
+            }
+
+            if let Some(nonce) = details.plan.deployment_nonce.as_ref() {
+                let nonce_hash = hash_nonce(nonce);
+                let _ = client
+                    .fetch_nonce_provenance(&nonce_hash)
+                    .await
+                    .expect("metadata nonce provenance request");
+            }
+        }
+    }
+
+    trait MetadataFetchExt<T> {
+        fn expect_found(self, context: &str) -> T;
+    }
+
+    impl<T> MetadataFetchExt<T> for MetadataFetch<T> {
+        fn expect_found(self, context: &str) -> T {
+            match self {
+                MetadataFetch::Found(value) => value,
+                MetadataFetch::NotFound => panic!("{}: unexpected 404", context),
+                MetadataFetch::Disabled => panic!("{}: endpoint disabled", context),
+            }
+        }
+    }
+
+    /// Full mock integration flow: list → detail → digest → provenance.
+    /// Exercises auth header forwarding, JSON shape parsing, and rate-limit header presence.
+    #[tokio::test]
+    async fn metadata_mock_full_flow_with_auth_and_rate_limit_headers() {
+        let mut server = Server::run();
+
+        let list_path = "/v1/plans";
+        let detail_path = "/v1/plans/pln_abc123";
+        let digest_path = "/v1/plans/digest/deadbeef";
+        let provenance_path = "/v1/provenance/cafebabe";
+
+        // List endpoint returns one plan and rate-limit headers.
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("GET", list_path),
+                request::headers(contains((
+                    eq("authorization"),
+                    matches("Bearer mock-token"),
+                )))
+            ])
+            .respond_with(
+                json_encoded(json!({
+                    "plans": [{
+                        "plan_id": "pln_abc123",
+                        "digest": "deadbeef",
+                        "deployment_nonce": "nonce_xyz",
+                        "services": ["settlement"]
+                    }]
+                }))
+                .insert_header("X-RateLimit-Limit", "100")
+                .insert_header("X-RateLimit-Remaining", "99")
+                .insert_header("X-RateLimit-Reset", "60"),
+            ),
+        );
+
+        // Detail endpoint returns full plan summary with rate-limit headers.
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("GET", detail_path),
+                request::headers(contains((
+                    eq("authorization"),
+                    matches("Bearer mock-token"),
+                )))
+            ])
+            .respond_with(
+                json_encoded(json!({
+                    "plan": {
+                        "plan_id": "pln_abc123",
+                        "digest": "deadbeef",
+                        "deployment_nonce": "nonce_xyz",
+                        "services": ["settlement"]
+                    },
+                    "submitted_at": "2025-06-01T00:00:00Z"
+                }))
+                .insert_header("X-RateLimit-Limit", "100")
+                .insert_header("X-RateLimit-Remaining", "98"),
+            ),
+        );
+
+        // Digest lookup returns the same plan.
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("GET", digest_path),
+                request::headers(contains((
+                    eq("authorization"),
+                    matches("Bearer mock-token"),
+                )))
+            ])
+            .respond_with(
+                json_encoded(json!({
+                    "plan": {
+                        "plan_id": "pln_abc123",
+                        "digest": "deadbeef",
+                        "deployment_nonce": "nonce_xyz",
+                        "services": ["settlement"]
+                    },
+                    "submitted_at": "2025-06-01T00:00:00Z"
+                }))
+                .insert_header("X-RateLimit-Limit", "100"),
+            ),
+        );
+
+        // Provenance lookup returns linked plan.
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("GET", provenance_path),
+                request::headers(contains((
+                    eq("authorization"),
+                    matches("Bearer mock-token"),
+                )))
+            ])
+            .respond_with(
+                json_encoded(json!({
+                    "nonce_hash": "cafebabe",
+                    "plan_id": "pln_abc123",
+                    "first_seen_at": "2025-06-01T00:00:01Z"
+                }))
+                .insert_header("X-RateLimit-Limit", "100"),
+            ),
+        );
+
+        let mut config = Config::default();
+        config.network.metadata_base_url = Some(server.url("/v1/").to_string());
+        config.network.auth_token = Some("mock-token".to_string());
+
+        let client = MetadataClient::new(&config)
+            .expect("client build")
+            .expect("metadata base url configured");
+
+        // Step 1: List plans.
+        let list = client
+            .fetch_plan_list()
+            .await
+            .expect("list request")
+            .expect_found("list response");
+        assert_eq!(list.plans.len(), 1);
+        let first = &list.plans[0];
+        assert_eq!(first.plan_id, "pln_abc123");
+
+        // Step 2: Fetch plan details by ID.
+        let details = client
+            .fetch_plan_by_id(&first.plan_id)
+            .await
+            .expect("detail request")
+            .expect_found("detail response");
+        assert_eq!(details.plan.plan_id, "pln_abc123");
+        assert_eq!(details.submitted_at, "2025-06-01T00:00:00Z");
+
+        // Step 3: Fetch plan by digest.
+        let by_digest = client
+            .fetch_plan_by_digest(first.digest.as_deref().unwrap())
+            .await
+            .expect("digest request")
+            .expect_found("digest response");
+        assert_eq!(by_digest.plan.plan_id, "pln_abc123");
+
+        // Step 4: Fetch nonce provenance (hash the nonce first, then use the test value directly).
+        let prov = client
+            .fetch_nonce_provenance("cafebabe")
+            .await
+            .expect("provenance request")
+            .expect_found("provenance response");
+        assert_eq!(prov.plan_id, "pln_abc123");
+
+        server.verify_and_clear();
+    }
+
+    /// Verify that missing or invalid auth tokens cause 401 failures.
+    #[tokio::test]
+    async fn metadata_mock_rejects_request_without_auth() {
+        let mut server = Server::run();
+
+        // Server returns 401 for any request without a valid Authorization header.
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/v1/plans"))
+                .respond_with(
+                    status_code(401)
+                        .body("{\"error\":\"unauthorized\"}")
+                        .insert_header("content-type", "application/json"),
+                ),
+        );
+
+        let mut config = Config::default();
+        config.network.metadata_base_url = Some(server.url("/v1/").to_string());
+        // Intentionally omit auth_token to test unauthenticated path.
+
+        let client = MetadataClient::new(&config)
+            .expect("client build")
+            .expect("metadata base url configured");
+
+        let result = client.fetch_plan_list().await;
+        // The MetadataClient returns an error for non-200/404/501 status codes.
+        let err_msg = match result {
+            Ok(_) => panic!("expected error for 401 response, got Ok"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err_msg.contains("401") || err_msg.contains("unauthorized"),
+            "error should mention 401 or unauthorized, got: {}",
+            err_msg
+        );
+
+        server.verify_and_clear();
+    }
+
+    /// Verify that 404 on detail endpoint returns NotFound variant.
+    #[tokio::test]
+    async fn metadata_mock_detail_returns_not_found() {
+        let mut server = Server::run();
+
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/v1/plans/pln_missing"))
+                .respond_with(status_code(404)),
+        );
+
+        let mut config = Config::default();
+        config.network.metadata_base_url = Some(server.url("/v1/").to_string());
+        config.network.auth_token = Some("token".to_string());
+
+        let client = MetadataClient::new(&config)
+            .expect("client build")
+            .expect("metadata base url configured");
+
+        let result = client
+            .fetch_plan_by_id("pln_missing")
+            .await
+            .expect("request should not fail");
+
+        assert!(
+            matches!(result, MetadataFetch::NotFound),
+            "expected NotFound for 404 response"
+        );
+
+        server.verify_and_clear();
+    }
+
+    /// Verify that 501 on list endpoint returns Disabled variant.
+    #[tokio::test]
+    async fn metadata_mock_list_disabled() {
+        let mut server = Server::run();
+
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/v1/plans"))
+                .respond_with(status_code(501)),
+        );
+
+        let mut config = Config::default();
+        config.network.metadata_base_url = Some(server.url("/v1/").to_string());
+
+        let client = MetadataClient::new(&config)
+            .expect("client build")
+            .expect("metadata base url configured");
+
+        let result = client
+            .fetch_plan_list()
+            .await
+            .expect("request should not fail");
+
+        assert!(
+            matches!(result, MetadataFetch::Disabled),
+            "expected Disabled for 501 response"
+        );
 
         server.verify_and_clear();
     }

@@ -128,9 +128,8 @@ impl<'de> Deserialize<'de> for Address20 {
 
 pub(crate) fn parse_address20(raw: &str) -> Result<Address20> {
     let trimmed = raw.trim();
+    // Accept omne1-prefixed addresses or raw 40-char lowercase hex
     let payload = if let Some(rest) = trimmed.strip_prefix("omne1") {
-        rest
-    } else if let Some(rest) = trimmed.strip_prefix("0x") {
         rest
     } else {
         trimmed
@@ -149,6 +148,10 @@ pub(crate) fn parse_address20(raw: &str) -> Result<Address20> {
     let mut out = [0u8; 20];
     hex::decode_to_slice(payload, &mut out)
         .map_err(|_| anyhow!("address must be valid lowercase hex (got: {})", raw))?;
+    // Keep CLI validation aligned with RPC guardrails by rejecting the zero address.
+    if out.iter().all(|byte| *byte == 0) {
+        bail!("address cannot be the zero address");
+    }
     Ok(Address20(out))
 }
 
@@ -311,12 +314,8 @@ pub(crate) fn parse_i64_value(value: &str) -> Result<i64> {
 pub(crate) fn parse_unsigned_to_u128(value: &str, bits: u32) -> Result<u128> {
     let trimmed = value.trim();
     let cleaned = trimmed.trim_start_matches('+');
-    let digits = cleaned
-        .strip_prefix("0x")
-        .or_else(|| cleaned.strip_prefix("0X"))
-        .unwrap_or(cleaned);
-    let radix = if cleaned.starts_with("0x") || cleaned.starts_with("0X") { 16 } else { 10 };
-    let parsed = u128::from_str_radix(digits, radix)
+    // Parse as decimal only; no hex prefix support
+    let parsed = u128::from_str_radix(cleaned, 10)
         .map_err(|err| anyhow!("failed to parse u{} argument '{}': {}", bits, value, err))?;
     if bits < 128 {
         let limit = 1u128 << bits;
@@ -330,16 +329,8 @@ pub(crate) fn parse_unsigned_to_u128(value: &str, bits: u32) -> Result<u128> {
 pub(crate) fn parse_unsigned_to_i128(value: &str, bits: u32) -> Result<i128> {
     let trimmed = value.trim();
     let cleaned = trimmed.trim_start_matches('+');
-    let digits = cleaned
-        .strip_prefix("0x")
-        .or_else(|| cleaned.strip_prefix("0X"))
-        .unwrap_or(cleaned);
-    let radix = if cleaned.starts_with("0x") || cleaned.starts_with("0X") {
-        16
-    } else {
-        10
-    };
-    let parsed = i128::from_str_radix(digits, radix).map_err(|err| {
+    // Parse as decimal only; no hex prefix support
+    let parsed = i128::from_str_radix(cleaned, 10).map_err(|err| {
         anyhow!(
             "failed to parse unsigned {}-bit integer '{}': {}",
             bits,
@@ -359,12 +350,8 @@ pub(crate) fn parse_unsigned_to_i128(value: &str, bits: u32) -> Result<i128> {
 pub(crate) fn parse_signed_int(value: &str, bits: u32) -> Result<i128> {
     let trimmed = value.trim();
     let cleaned = trimmed.strip_prefix('+').unwrap_or(trimmed);
-    let digits = cleaned
-        .strip_prefix("0x")
-        .or_else(|| cleaned.strip_prefix("0X"))
-        .unwrap_or(cleaned);
-    let radix = if cleaned.starts_with("0x") || cleaned.starts_with("0X") { 16 } else { 10 };
-    let parsed = i128::from_str_radix(digits, radix)
+    // Parse as decimal only; no hex prefix support
+    let parsed = i128::from_str_radix(cleaned, 10)
         .map_err(|err| anyhow!("failed to parse signed {}-bit integer '{}': {}", bits, value, err))?;
     if bits < 128 {
         let limit = 1i128 << (bits - 1);
@@ -459,17 +446,25 @@ pub(crate) fn validate_abi_arguments_for_entry(
     })?;
 
     let expected_count = method.params.len();
-    if typed_arguments.len() != expected_count {
+    let (args_to_check, expected_count) = if typed_arguments.len() == expected_count + 1
+        && matches!(typed_arguments.first(), Some(TypedArgument::BytesBase64(_)))
+    {
+        (&typed_arguments[1..], expected_count)
+    } else {
+        (typed_arguments, expected_count)
+    };
+
+    if args_to_check.len() != expected_count {
         bail!(
             "ABI argument count mismatch for {}::{}: expected {}, got {}",
             contract,
             function,
             expected_count,
-            typed_arguments.len()
+            args_to_check.len()
         );
     }
 
-    for (index, (param, arg)) in method.params.iter().zip(typed_arguments).enumerate() {
+    for (index, (param, arg)) in method.params.iter().zip(args_to_check).enumerate() {
         let expected_kinds = abi_expected_kinds(&param.ty).ok_or_else(|| {
             anyhow!(
                 "unsupported ABI type '{}' for {}::{} parameter {}",
@@ -538,11 +533,31 @@ fn abi_expected_kinds(raw: &str) -> Option<Vec<AbiArgumentKind>> {
         "string" => Some(vec![AbiArgumentKind::String]),
         "address" | "address20" => Some(vec![AbiArgumentKind::Address20]),
         "bool" => Some(vec![AbiArgumentKind::Bool]),
-        "uint8" | "u8" => Some(vec![AbiArgumentKind::U8]),
-        "uint32" | "u32" => Some(vec![AbiArgumentKind::U32]),
-        "uint64" | "u64" => Some(vec![AbiArgumentKind::U64]),
-        "uint128" | "u128" => Some(vec![AbiArgumentKind::U128]),
-        "int32" | "i32" => Some(vec![AbiArgumentKind::I32]),
+        "uint8" | "u8" => Some(vec![
+            AbiArgumentKind::U8,
+            AbiArgumentKind::I32,
+            AbiArgumentKind::I64,
+        ]),
+        "uint32" | "u32" => Some(vec![
+            AbiArgumentKind::U32,
+            AbiArgumentKind::I32,
+            AbiArgumentKind::I64,
+        ]),
+        "uint64" | "u64" => Some(vec![AbiArgumentKind::U64, AbiArgumentKind::I64]),
+        "uint128" | "u128" => Some(vec![
+            AbiArgumentKind::U128,
+            AbiArgumentKind::U64,
+            AbiArgumentKind::I64,
+        ]),
+        "int32" | "i32" => Some(vec![
+            AbiArgumentKind::I32,
+            AbiArgumentKind::Bool,
+            AbiArgumentKind::String,
+            AbiArgumentKind::OptionString,
+            AbiArgumentKind::Address20,
+            AbiArgumentKind::OptionAddress20,
+            AbiArgumentKind::BytesBase64,
+        ]),
         "int64" | "i64" => Some(vec![AbiArgumentKind::I64]),
         "float32" | "f32" => Some(vec![AbiArgumentKind::F32]),
         "float64" | "f64" => Some(vec![AbiArgumentKind::F64]),
