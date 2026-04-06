@@ -2926,7 +2926,7 @@ fn log_guardrail_notice(enforce_warning: bool, message: impl Into<String>) {
 }
 
 fn is_dev_network(name: &str) -> bool {
-    matches!(name, "devnet" | "omne_devnet")
+    matches!(name, "devnet" | "omne_devnet" | "ignis" | "omne_ignis")
 }
 
 fn is_production_network(name: &str) -> bool {
