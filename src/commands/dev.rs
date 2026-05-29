@@ -23,12 +23,11 @@ use base64ct::{Base64, Encoding};
 use chrono::Utc;
 use clap::{ArgAction, Args, Subcommand, ValueEnum};
 use deploy_guardrails::{
-    compiler_signers_vec_for_network, enforce_allowed_services, validate_execution_guardrails,
+    compiler_signers_vec_for_network, enforce_allowed_services, pqc, validate_execution_guardrails,
     verify_metadata_signature,
     SignerAllowList,
 };
 use dialoguer::Select;
-use ed25519_dalek::{Signer, SigningKey};
 use hex;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -1099,7 +1098,7 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
             allow_unsigned_metadata,
         )?;
 
-        let mut plan_signer: Option<[u8; 32]> = None;
+        let mut plan_signer: Option<Vec<u8>> = None;
 
         let has_external_signature =
             resolved.plan_signature_hex.is_some() || resolved.plan_signature_pubkey.is_some();
@@ -1118,7 +1117,7 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
 
             let verifying_key =
                 attach_plan_signature_with_hex(&mut execution_plan, signature_hex, public_key_hex)?;
-            let verifying_hex = hex::encode(verifying_key);
+            let verifying_hex = hex::encode(&verifying_key);
             info!(
                 "🔏 Execution plan signed with external key {}",
                 verifying_hex
@@ -1128,16 +1127,17 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
             warn!("⚠️ Skipping plan signing; hardened endpoints will reject unsigned submissions.");
         } else if let Some(key_path) = resolved.signing_key.as_deref() {
             let verifying_key = sign_execution_plan(&mut execution_plan, key_path).await?;
-            let verifying_hex = hex::encode(verifying_key);
+            let verifying_hex = hex::encode(&verifying_key);
             info!(
                 "🔏 Execution plan signed with supplied key {}",
                 verifying_hex
             );
             plan_signer = Some(verifying_key);
         } else {
-            let signing_key = SigningKey::generate(&mut OsRng);
-            let verifying_key = attach_plan_signature_with_key(&mut execution_plan, &signing_key)?;
-            let verifying_hex = hex::encode(verifying_key);
+            let mut seed = [0u8; 32];
+            OsRng.fill_bytes(&mut seed);
+            let verifying_key = attach_plan_signature_with_seed(&mut execution_plan, seed)?;
+            let verifying_hex = hex::encode(&verifying_key);
             info!(
                 "🔏 Execution plan signed with ephemeral key {}",
                 verifying_hex
@@ -1145,11 +1145,7 @@ async fn deploy_project(args: &DeployPlanArgs, config: &Config) -> Result<()> {
 
             let mut key_path = plan_path.clone();
             key_path.set_extension("signing-key");
-            fs::write(
-                &key_path,
-                format!("{}\n", hex::encode(signing_key.to_bytes())),
-            )
-            .await?;
+            fs::write(&key_path, format!("{}\n", hex::encode(seed))).await?;
             info!(
                 "   Ephemeral signing key written to {} (delete after promotion)",
                 key_path.display()
@@ -1428,11 +1424,11 @@ async fn verify_execution_plan(
     )
     .map_err(|err| anyhow!(err.to_string()))?;
 
-    let verifying_bytes = verifying_key.to_bytes();
+    let verifying_bytes = verifying_key;
 
     info!("✅ Execution plan signature verified");
     info!("   Digest: {}", hex::encode(digest));
-    info!("   Signer: {}", hex::encode(verifying_bytes));
+    info!("   Signer: {}", hex::encode(&verifying_bytes));
 
     if let Some(list) = allow_list {
         if list.contains_bytes(&verifying_bytes) {
@@ -1532,7 +1528,7 @@ async fn submit_deployment_plan(
     )
     .map_err(|err| anyhow!(err.to_string()))?;
 
-    let verifying_hex = hex::encode(verifying_key.to_bytes());
+    let verifying_hex = hex::encode(&verifying_key);
     info!("   Plan signature verified for signer {}", verifying_hex);
 
     let effective_auth_token = defaults
@@ -2279,7 +2275,7 @@ fn build_execution_plan(
     }
 
     if let Some(caller) = caller_address {
-        exec_config = exec_config.with_caller_address(caller);
+        exec_config = exec_config.with_caller_address(widen_preview_address(caller));
     }
 
     // Default to preserving typed arguments so runtimes can materialize pointer/length
@@ -2321,7 +2317,7 @@ fn build_execution_plan(
         )?;
         if preview_config.contract_address.is_none() {
             preview_config = preview_config.with_contract_address(
-                derive_preview_contract_address(module.bytes()),
+                widen_preview_address(derive_preview_contract_address(module.bytes())),
             );
         }
         let state_manager = Arc::new(StateManager::new_fastvm_optimized()?);
@@ -2423,7 +2419,7 @@ fn build_execution_plan(
 
                 info!(
                     "   Compiler metadata signature verified (signer {})",
-                    hex::encode(verifying_key.to_bytes())
+                    hex::encode(&verifying_key)
                 );
             }
 
@@ -2676,6 +2672,16 @@ fn encode_len_prefixed_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Widen a 20-byte contract-ABI address to the 32-byte form the runtime uses
+/// for state-storage namespacing during a local execution preview. The preview
+/// is a local dry-run, so the low-20/high-zero padding is purely an internal
+/// namespacing key and never reaches consensus.
+fn widen_preview_address(addr: [u8; 20]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[..20].copy_from_slice(&addr);
+    out
+}
+
 fn derive_preview_contract_address(wasm: &[u8]) -> [u8; 20] {
     let digest = Sha256::digest(wasm);
     let mut out = [0u8; 20];
@@ -2683,7 +2689,7 @@ fn derive_preview_contract_address(wasm: &[u8]) -> [u8; 20] {
     out
 }
 
-async fn sign_execution_plan(plan: &mut ExecutionPlan, key_path: &str) -> Result<[u8; 32]> {
+async fn sign_execution_plan(plan: &mut ExecutionPlan, key_path: &str) -> Result<Vec<u8>> {
     let raw = fs::read(key_path)
         .await
         .with_context(|| format!("failed to read signing key from {}", key_path))?;
@@ -2692,7 +2698,7 @@ async fn sign_execution_plan(plan: &mut ExecutionPlan, key_path: &str) -> Result
         raw
     } else {
         let key_str = String::from_utf8(raw)
-            .context("signing key file must contain raw 32-byte seed or hex-encoded secret")?;
+            .context("signing key file must contain raw 32-byte seed or hex-encoded seed")?;
         let cleaned = key_str.trim();
         if cleaned.len() == 64 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
             hex::decode(cleaned)?
@@ -2701,48 +2707,59 @@ async fn sign_execution_plan(plan: &mut ExecutionPlan, key_path: &str) -> Result
         }
     };
 
-    let secret_array: [u8; 32] = secret_bytes
+    let seed: [u8; 32] = secret_bytes
         .try_into()
-        .map_err(|_| anyhow!("signing key must decode to exactly 32 bytes"))?;
+        .map_err(|_| anyhow!("signing key seed must decode to exactly 32 bytes"))?;
 
-    let signing_key = SigningKey::from_bytes(&secret_array);
-    attach_plan_signature_with_key(plan, &signing_key)
+    attach_plan_signature_with_seed(plan, seed)
 }
 
-fn attach_plan_signature_with_key(
+fn attach_plan_signature_with_seed(
     plan: &mut ExecutionPlan,
-    signing_key: &SigningKey,
-) -> Result<[u8; 32]> {
+    seed: [u8; 32],
+) -> Result<Vec<u8>> {
+    let (public_key, secret_key) = pqc::keygen_from_seed(seed);
     let digest = compute_plan_digest(plan)?;
-    let signature = signing_key.sign(&digest);
-    let verifying_key = signing_key.verifying_key();
+    let signature = pqc::sign(&secret_key, &digest).map_err(|err| anyhow!(err))?;
 
     plan.signature = Some(PlanSignature {
-        algorithm: "ed25519".to_string(),
-        public_key_hex: hex::encode(verifying_key.to_bytes()),
-        signature_hex: hex::encode(signature.to_bytes()),
+        algorithm: pqc::ALGORITHM_ID.to_string(),
+        public_key_hex: hex::encode(&public_key),
+        signature_hex: hex::encode(&signature),
     });
 
-    Ok(verifying_key.to_bytes())
+    Ok(public_key)
 }
 
 fn attach_plan_signature_with_hex(
     plan: &mut ExecutionPlan,
     signature_hex: &str,
     public_key_hex: &str,
-) -> Result<[u8; 32]> {
+) -> Result<Vec<u8>> {
     let signature_clean = signature_hex.trim();
-    if signature_clean.len() != 128 || !signature_clean.chars().all(|c| c.is_ascii_hexdigit()) {
-        bail!("plan signature must be 64 bytes (128 hex characters)");
+    if signature_clean.len() != pqc::SIGNATURE_LEN * 2
+        || !signature_clean.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        bail!(
+            "plan signature must be {} bytes ({} hex characters)",
+            pqc::SIGNATURE_LEN,
+            pqc::SIGNATURE_LEN * 2
+        );
     }
 
     let public_key_clean = public_key_hex.trim();
-    if public_key_clean.len() != 64 || !public_key_clean.chars().all(|c| c.is_ascii_hexdigit()) {
-        bail!("plan signature public key must be 32 bytes (64 hex characters)");
+    if public_key_clean.len() != pqc::PUBLIC_KEY_LEN * 2
+        || !public_key_clean.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        bail!(
+            "plan signature public key must be {} bytes ({} hex characters)",
+            pqc::PUBLIC_KEY_LEN,
+            pqc::PUBLIC_KEY_LEN * 2
+        );
     }
 
     let plan_signature = PlanSignature {
-        algorithm: "ed25519".to_string(),
+        algorithm: pqc::ALGORITHM_ID.to_string(),
         public_key_hex: public_key_clean.to_ascii_lowercase(),
         signature_hex: signature_clean.to_ascii_lowercase(),
     };
@@ -2760,7 +2777,7 @@ fn attach_plan_signature_with_hex(
     )
     .map_err(|err| anyhow!("KMS plan signature verification failed: {err}"))?;
 
-    Ok(verifying_key.to_bytes())
+    Ok(verifying_key)
 }
 
 fn compute_plan_digest(plan: &ExecutionPlan) -> Result<[u8; 32]> {
@@ -2997,7 +3014,6 @@ mod tests {
     use super::*;
     use axiom_runtime::execution::SerializableVal;
     use deploy_guardrails::{CompilerMetadata, CompilerMetadataSignature};
-    use ed25519_dalek::SigningKey;
     use httptest::{
         matchers::{all_of, contains, eq, matches, request},
         responders::{json_encoded, status_code},
@@ -3065,18 +3081,17 @@ mod tests {
             host_functions: Vec::new(),
         };
 
-        let signing_key = SigningKey::from_bytes(&[5u8; 32]);
+        let (public_key, secret_key) = pqc::keygen_from_seed([5u8; 32]);
         let digest = deploy_guardrails::canonical_metadata_digest(&metadata).expect("digest");
-        let signature = signing_key.sign(digest.as_ref());
-        let verifying_key = signing_key.verifying_key();
-        let verifying_hex = hex::encode(verifying_key.to_bytes());
+        let signature = pqc::sign(&secret_key, digest.as_ref()).expect("sign");
+        let verifying_hex = hex::encode(&public_key);
 
         let attachment = CompilerAttachment {
             metadata,
             signature: Some(CompilerMetadataSignature {
-                algorithm: "ed25519".to_string(),
+                algorithm: pqc::ALGORITHM_ID.to_string(),
                 public_key_hex: verifying_hex.clone(),
-                signature_hex: hex::encode(signature.to_bytes()),
+                signature_hex: hex::encode(&signature),
                 digest_hex: hex::encode(digest),
                 signed_at: "2024-01-01T00:00:00Z".to_string(),
             }),
@@ -3183,9 +3198,10 @@ mod tests {
         )
         .expect("plan build");
 
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
         let mut key_file = NamedTempFile::new().expect("temp key");
-        write!(key_file, "{}", hex::encode(signing_key.to_bytes())).expect("write key");
+        write!(key_file, "{}", hex::encode(seed)).expect("write key");
         let key_path = key_file.into_temp_path();
 
         let verifying_key = sign_execution_plan(&mut plan, key_path.to_str().unwrap())
@@ -3193,10 +3209,10 @@ mod tests {
             .expect("sign plan");
 
         let signature = plan.signature.expect("signature present");
-        assert_eq!(signature.algorithm, "ed25519");
-        assert_eq!(signature.public_key_hex.len(), 64);
-        assert_eq!(signature.signature_hex.len(), 128);
-        assert_eq!(hex::encode(verifying_key).len(), 64);
+        assert_eq!(signature.algorithm, pqc::ALGORITHM_ID);
+        assert_eq!(signature.public_key_hex.len(), pqc::PUBLIC_KEY_LEN * 2);
+        assert_eq!(signature.signature_hex.len(), pqc::SIGNATURE_LEN * 2);
+        assert_eq!(hex::encode(verifying_key).len(), pqc::PUBLIC_KEY_LEN * 2);
     }
 
     #[test]
@@ -3257,9 +3273,8 @@ mod tests {
         )
         .expect("plan build");
 
-        let signing_key = SigningKey::from_bytes(&[3u8; 32]);
         let verifying_key =
-            attach_plan_signature_with_key(&mut plan, &signing_key).expect("sign plan");
+            attach_plan_signature_with_seed(&mut plan, [3u8; 32]).expect("sign plan");
 
         let plan_bytes = serde_json::to_vec_pretty(&plan).expect("serialize plan");
         let mut plan_file = NamedTempFile::new().expect("plan file");
