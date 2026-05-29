@@ -5,7 +5,7 @@ use deploy_guardrails::metadata::{
     CompilerContractMetadata, CompilerContractMethodMetadata, CompilerMetadata,
     CompilerFunctionParamMetadata, CompilerMetadataSignature,
 };
-use ed25519_dalek::{Signer, SigningKey};
+use deploy_guardrails::pqc;
 use hex::FromHex;
 use serde::Serialize;
 use sha2::Digest;
@@ -296,18 +296,17 @@ fn sign_metadata(
     if key_bytes.len() != 32 {
         bail!("signing key must be 32 bytes, found {}", key_bytes.len());
     }
-    let mut key_array = [0u8; 32];
-    key_array.copy_from_slice(&key_bytes);
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&key_bytes);
 
-    let signing_key = SigningKey::from_bytes(&key_array);
+    let (public_key, secret_key) = pqc::keygen_from_seed(seed);
     let digest = canonical_metadata_digest(metadata).map_err(|err| anyhow!(err.to_string()))?;
-    let signature = signing_key.sign(digest.as_ref());
-    let verifying_key = signing_key.verifying_key();
+    let signature = pqc::sign(&secret_key, digest.as_ref()).map_err(|err| anyhow!(err))?;
 
     Ok(CompilerMetadataSignature {
-        algorithm: "ed25519".to_string(),
-        public_key_hex: hex::encode(verifying_key.to_bytes()),
-        signature_hex: hex::encode(signature.to_bytes()),
+        algorithm: pqc::ALGORITHM_ID.to_string(),
+        public_key_hex: hex::encode(&public_key),
+        signature_hex: hex::encode(&signature),
         digest_hex: hex::encode(digest),
         signed_at: Utc::now().to_rfc3339(),
     })
