@@ -3,7 +3,6 @@ name: Release OMNE CLI
 # Required secrets:
 # - CARGO_REGISTRY_TOKEN: Token for publishing to crates.io
 # - HOMEBREW_GITHUB_TOKEN: GitHub token for updating Homebrew formula
-# - DOCS_DEPLOY_TOKEN: GitHub token for deploying documentation
 
 on:
   push:
