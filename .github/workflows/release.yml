@@ -235,20 +235,3 @@ jobs:
         run: |
           # This will be handled by a separate workflow due to Snap store requirements  
           echo "Snap package update triggered"
-
-  update-docs:
-    name: Update Documentation Site
-    runs-on: ubuntu-latest
-    needs: create-release
-    steps:
-      - name: Trigger docs deployment
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.DOCS_DEPLOY_TOKEN }}
-          script: |
-            await github.rest.actions.createWorkflowDispatch({
-              owner: 'OmneDAO',
-              repo: 'omne-foundation',
-              workflow_id: 'deploy-docs.yml',
-              ref: 'master'
-            });
